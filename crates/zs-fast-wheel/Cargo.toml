@@ -1,0 +1,50 @@
+[package]
+name = "zs-fast-wheel"
+version = "0.1.0"
+edition = "2024"
+description = "Fast parallel Python wheel downloader + extractor with streaming support"
+license = "Apache-2.0"
+
+[[bin]]
+name = "zs-fast-wheel"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP downloads
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+futures = "0.3"
+
+# Zip extraction
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# io_uring for Linux
+io-uring = { version = "0.7", optional = true }
+
+# Memory mapping
+memmap2 = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+
+# Progress
+indicatif = "0.17"
+
+# Misc
+tempfile = "3"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+nix = { version = "0.29", features = ["fs", "mman"] }
+rayon = "1"
+urlencoding = "2"
+flate2 = "1"
+
+[features]
+default = []
+iouring = ["io-uring"]
