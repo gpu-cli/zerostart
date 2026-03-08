@@ -1,7 +1,8 @@
 #!/bin/bash
 # GPU Test Runner — runs zerostart test plan on a GPU pod
 # Usage: gpu run "bash tests/gpu_test_runner.sh"
-set -euo pipefail
+set -uo pipefail
+# NOTE: no set -e — we handle test failures ourselves via pass/fail counters
 
 PASS=0
 FAIL=0
@@ -105,7 +106,7 @@ assert sys.argv[1] == "--port", f"expected --port, got {sys.argv[1]}"
 assert sys.argv[2] == "8000", f"expected 8000, got {sys.argv[2]}"
 print("args ok")
 PYEOF
-if zerostart /tmp/test_args.py -- --port 8000 2>&1; then
+if zerostart /tmp/test_args.py --port 8000 2>&1; then
     pass "1.4 script args"
 else
     fail "1.4 script args" "exit $?"
