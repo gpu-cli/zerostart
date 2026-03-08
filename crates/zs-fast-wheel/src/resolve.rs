@@ -101,7 +101,7 @@ fn uv_resolve(
     }
     tmp.flush()?;
 
-    let platform_tag = format!("x86_64-unknown-{platform}-gnu");
+    let platform_tag = platform_to_uv_tag(platform);
 
     let output = Command::new("uv")
         .args([
@@ -174,23 +174,48 @@ async fn lookup_pypi_wheel(
 
     let py_tag = format!("cp{}", python_version.replace('.', ""));
 
-    // Priority: platform-specific + python version > none-any > first .whl
+    // Extract arch from platform string (e.g. "linux" → detect at runtime,
+    // "x86_64-unknown-linux-gnu" → "x86_64", "aarch64-unknown-linux-gnu" → "aarch64")
+    let arch_tag = platform_to_arch(platform);
+
+    // Priority: platform-specific + python version + correct arch > abi3 + arch > none-any > first .whl
     let mut best: Option<&PyPIFile> = None;
+    let mut best_priority = 0u8;
 
     for f in &data.urls {
         if !f.filename.ends_with(".whl") {
             continue;
         }
-        if platform == "linux" && f.filename.contains("linux") && f.filename.contains(&py_tag) {
+
+        let is_none_any = f.filename.contains("none-any");
+        let has_linux = f.filename.contains("linux");
+        let has_arch = f.filename.contains(arch_tag);
+        let has_py_tag = f.filename.contains(&py_tag);
+        let has_abi3 = f.filename.contains("abi3");
+
+        // Best: platform-specific wheel matching python version and architecture
+        if has_linux && has_arch && has_py_tag && !has_abi3 && best_priority < 4 {
             best = Some(f);
-            break;
+            best_priority = 4;
         }
-        if f.filename.contains("none-any") && best.is_none() {
+        // Good: abi3 wheel (stable ABI) matching architecture
+        else if has_linux && has_arch && has_abi3 && best_priority < 3 {
             best = Some(f);
+            best_priority = 3;
+        }
+        // OK: platform wheel with right arch but maybe wrong python tag
+        else if has_linux && has_arch && best_priority < 2 {
+            best = Some(f);
+            best_priority = 2;
+        }
+        // Fallback: none-any (pure Python)
+        else if is_none_any && best_priority < 1 {
+            best = Some(f);
+            best_priority = 1;
         }
     }
 
-    // Fallback to first .whl
+    // Last resort: first .whl (might be wrong arch but better than nothing)
     if best.is_none() {
         best = data.urls.iter().find(|f| f.filename.ends_with(".whl"));
     }
@@ -206,6 +231,43 @@ async fn lookup_pypi_wheel(
         size: file.size,
         hash: None,
     })
+}
+
+/// Detect the current machine's CPU architecture.
+fn detect_arch() -> &'static str {
+    std::env::consts::ARCH // "x86_64", "aarch64", etc.
+}
+
+/// Convert a platform string to a wheel filename arch tag.
+///
+/// Accepts short forms ("linux") or full triples ("x86_64-unknown-linux-gnu").
+/// Short forms auto-detect the current machine's architecture.
+fn platform_to_arch(platform: &str) -> &str {
+    if platform.starts_with("x86_64") {
+        "x86_64"
+    } else if platform.starts_with("aarch64") || platform.starts_with("arm64") {
+        "aarch64"
+    } else {
+        // Short form like "linux" — detect from current machine
+        detect_arch()
+    }
+}
+
+/// Convert a platform string to uv's `--python-platform` tag.
+///
+/// Accepts short forms ("linux") or passes through full triples.
+fn platform_to_uv_tag(platform: &str) -> String {
+    if platform.contains("-unknown-") || platform.contains("-apple-") {
+        // Already a full triple
+        return platform.to_string();
+    }
+    // Short form: detect arch and build triple
+    let arch = detect_arch();
+    match platform {
+        "linux" => format!("{arch}-unknown-linux-gnu"),
+        "macos" | "macosx" => format!("{arch}-apple-darwin"),
+        _ => format!("{arch}-unknown-{platform}-gnu"),
+    }
 }
 
 /// Guess import root names from distribution name.
