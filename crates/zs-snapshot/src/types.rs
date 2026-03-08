@@ -25,10 +25,15 @@ pub struct SnapshotMetadata {
     pub argv: Vec<String>,
     pub python_version: String,
     pub platform: String,
+    #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
+    #[serde(default)]
     pub image_size_bytes: u64,
+    #[serde(default)]
     pub dump_duration_ms: u64,
+    #[serde(default)]
     pub restore_count: u32,
+    #[serde(default)]
     pub last_restored_at: Option<DateTime<Utc>>,
 }
 
