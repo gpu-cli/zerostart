@@ -6,7 +6,7 @@ description = "Fast parallel Python wheel downloader + extractor with streaming 
 license = "MIT"
 
 [[bin]]
-name = "zs-fast-wheel"
+name = "zerostart"
 path = "src/main.rs"
 
 [lib]
@@ -51,6 +51,8 @@ flate2 = "1"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
 toml = "0.8"
 pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
 

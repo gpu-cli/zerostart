@@ -2,6 +2,7 @@
 
 Layout:
     .zerostart/
+      inputs/{input_hash}      # maps raw requirements → env_key (fast warm lookup)
       plans/{env_key}.json     # cached artifact plan
       envs/{env_key}/          # completed environment (venv)
       envs/{env_key}.tmp/      # in-progress environment build
@@ -9,13 +10,13 @@ Layout:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict
 from pathlib import Path
 
 from zerostart.resolver import ArtifactPlan
@@ -25,6 +26,20 @@ log = logging.getLogger("zerostart.cache")
 DEFAULT_CACHE_DIR = Path(".zerostart")
 
 
+def _input_hash(
+    requirements: list[str],
+    python_version: str = "3.11",
+    platform: str = "linux",
+) -> str:
+    """Hash raw input requirements for fast cache lookup."""
+    payload = json.dumps({
+        "requirements": sorted(requirements),
+        "python_version": python_version,
+        "platform": platform,
+    }, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
 class EnvironmentCache:
     """Manages cached environments keyed by artifact plan."""
 
@@ -32,8 +47,56 @@ class EnvironmentCache:
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
         self.plans_dir = self.cache_dir / "plans"
         self.envs_dir = self.cache_dir / "envs"
+        self.inputs_dir = self.cache_dir / "inputs"
         self.plans_dir.mkdir(parents=True, exist_ok=True)
         self.envs_dir.mkdir(parents=True, exist_ok=True)
+        self.inputs_dir.mkdir(parents=True, exist_ok=True)
+
+    def lookup_by_input(
+        self,
+        requirements: list[str],
+        python_version: str = "3.11",
+        platform: str = "linux",
+    ) -> CachedEnv | None:
+        """Fast warm-path lookup: skip resolution entirely.
+
+        Checks if we've seen these exact input requirements before and
+        have a completed environment for them.
+        """
+        ih = _input_hash(requirements, python_version, platform)
+        input_file = self.inputs_dir / ih
+
+        if not input_file.exists():
+            return None
+
+        env_key = input_file.read_text().strip()
+        env_dir = self.envs_dir / env_key
+
+        if not env_dir.exists() or not (env_dir / ".complete").exists():
+            return None
+
+        sp = _find_site_packages(env_dir)
+        if not sp:
+            return None
+
+        return CachedEnv(
+            env_dir=env_dir,
+            site_packages=sp,
+            is_complete=True,
+            key=env_key,
+        )
+
+    def save_input_mapping(
+        self,
+        requirements: list[str],
+        plan: ArtifactPlan,
+        python_version: str = "3.11",
+        platform: str = "linux",
+    ) -> None:
+        """Save mapping from raw requirements → env cache key."""
+        ih = _input_hash(requirements, python_version, platform)
+        input_file = self.inputs_dir / ih
+        input_file.write_text(plan.cache_key)
 
     def lookup(self, plan: ArtifactPlan) -> CachedEnv | None:
         """Check if a completed environment exists for this plan."""

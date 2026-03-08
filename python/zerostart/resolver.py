@@ -10,10 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import platform as platform_mod
 import re
 import subprocess
 import tempfile
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -21,6 +23,20 @@ log = logging.getLogger("zerostart.resolver")
 
 # Wheels smaller than this go through uv (tiny/metadata-sensitive)
 UV_THRESHOLD = 1 * 1024 * 1024  # 1MB
+
+
+def _detect_arch() -> str:
+    """Detect the machine architecture for wheel selection.
+
+    Returns arch string as used in wheel filenames (e.g. 'x86_64', 'aarch64').
+    """
+    machine = platform_mod.machine().lower()
+    # Normalize common aliases
+    if machine in ("x86_64", "amd64"):
+        return "x86_64"
+    if machine in ("aarch64", "arm64"):
+        return "aarch64"
+    return machine
 
 
 @dataclass
@@ -86,10 +102,29 @@ class ArtifactPlan:
         return hashlib.sha256(payload.encode()).hexdigest()
 
 
+def _detect_python_version() -> str:
+    """Detect the running Python's major.minor version."""
+    import sys
+    return f"{sys.version_info.major}.{sys.version_info.minor}"
+
+
+def _detect_platform() -> str:
+    """Detect the current platform for wheel selection.
+
+    Returns 'linux' or 'macos' — the values uv pip compile accepts.
+    """
+    import sys
+    if sys.platform == "linux":
+        return "linux"
+    if sys.platform == "darwin":
+        return "macos"
+    return sys.platform
+
+
 def resolve_requirements(
     requirements: list[str],
-    python_version: str = "3.11",
-    platform: str = "linux",
+    python_version: str | None = None,
+    platform: str | None = None,
 ) -> ArtifactPlan:
     """Resolve requirements to exact artifacts via uv pip compile + PyPI JSON.
 
@@ -97,6 +132,11 @@ def resolve_requirements(
     for wheel URLs. This works for public PyPI packages. Custom indexes
     and direct URLs need Option A/B from the planning doc.
     """
+    if python_version is None:
+        python_version = _detect_python_version()
+    if platform is None:
+        platform = _detect_platform()
+
     if not requirements:
         return ArtifactPlan(artifacts=[], python_version=python_version, platform=platform)
 
@@ -105,20 +145,37 @@ def resolve_requirements(
     if not resolved:
         return ArtifactPlan(artifacts=[], python_version=python_version, platform=platform)
 
-    # Step 2: Look up wheel URLs and sizes from PyPI JSON
+    # Step 2: Look up wheel URLs and sizes from PyPI JSON (parallel)
     artifacts = []
-    for dist, version in resolved:
-        artifact = _lookup_pypi_wheel(dist, version, python_version, platform)
-        if artifact:
-            artifacts.append(artifact)
-        else:
-            log.warning("could not find wheel URL for %s==%s", dist, version)
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        futures = {
+            pool.submit(_lookup_pypi_wheel, dist, version, python_version, platform): (dist, version)
+            for dist, version in resolved
+        }
+        for future in as_completed(futures):
+            dist, version = futures[future]
+            artifact = future.result()
+            if artifact:
+                artifacts.append(artifact)
+            else:
+                log.warning("could not find wheel URL for %s==%s", dist, version)
 
     return ArtifactPlan(
         artifacts=artifacts,
         python_version=python_version,
         platform=platform,
     )
+
+
+def _uv_platform_tag(platform: str) -> str:
+    """Build the --python-platform value for uv pip compile."""
+    arch = _detect_arch()
+    if platform == "macos":
+        return f"{arch}-apple-darwin"
+    if platform == "linux":
+        return f"{arch}-unknown-linux-gnu"
+    # Fallback: pass through (uv will validate)
+    return platform
 
 
 def _uv_resolve(
@@ -137,7 +194,7 @@ def _uv_resolve(
             [
                 "uv", "pip", "compile", req_file,
                 "--python-version", python_version,
-                "--python-platform", f"x86_64-unknown-{platform}-gnu",
+                "--python-platform", _uv_platform_tag(platform),
                 "--no-header",
             ],
             capture_output=True,
@@ -197,8 +254,10 @@ def _lookup_pypi_wheel(
         file_url = file_info["url"]
         file_size = file_info.get("size", 0)
 
-        # Prefer platform-specific, then any
-        if platform == "linux" and "linux" in filename and py_tag in filename:
+        # Prefer platform-specific wheel matching current arch
+        arch = _detect_arch()
+        plat_tag = "macosx" if platform == "macos" else platform
+        if plat_tag in filename and py_tag in filename and arch in filename:
             best_url = file_url
             best_size = file_size
             break
