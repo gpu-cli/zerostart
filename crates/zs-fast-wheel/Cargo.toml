@@ -18,7 +18,7 @@ crate-type = ["cdylib", "rlib"]
 tokio = { version = "1", features = ["full"] }
 
 # HTTP downloads
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
 futures = "0.3"
 
 # Zip extraction
@@ -51,6 +51,7 @@ flate2 = "1"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
 
 [features]

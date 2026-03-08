@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "zs-fast-wheel"
+version = "0.1.0"
+description = "Fast parallel Python wheel downloader + extractor with streaming support"
+requires-python = ">=3.10"
+
+[tool.maturin]
+features = ["python"]
+module-name = "zs_fast_wheel"
