@@ -10,7 +10,7 @@
   "outputs": ["benches/results/"],
   "environment": {
     "system": {
-      "apt": [{ "name": "curl" }, { "name": "criu" }]
+      "apt": [{ "name": "curl" }]
     },
     "shell": {
       "steps": [

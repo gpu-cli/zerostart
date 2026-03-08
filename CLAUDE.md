@@ -4,9 +4,9 @@
 
 Open-source Rust binary + Python SDK that eliminates GPU cold starts for Python applications. Fast parallel package installation (uv + streaming wheel extraction) and progressive imports let your app start using packages while they're still installing.
 
-Drop-in wrapper — `zerostart run python serve.py` — that makes cold starts fast (~10-30s vs minutes).
+Drop-in wrapper — `zerostart serve.py` — that makes cold starts fast (~10-30s vs minutes).
 
-Repository: `github.com/gpu-cli/zerostart` (Apache 2.0)
+Repository: `github.com/gpu-cli/zerostart` (MIT)
 
 ## Build & Development
 
@@ -44,9 +44,9 @@ First run installs everything (~30s). Subsequent runs reuse the cached environme
 
 ## Key Decision: No CRIU
 
-CRIU process snapshots (Tier 0/1 in the original design) are **deferred indefinitely**. Reason: container GPU providers (RunPod, Vast.ai) don't grant `CAP_SYS_ADMIN` needed for CRIU. VM providers that support CRIU take 3-5min to boot, negating the ~2s restore benefit. The plans remain in `../private-zerostart/planning/criu-process-snapshots/` for future reference if container providers add privileged mode.
+CRIU process snapshots (Tier 0/1 in the original design) are **deferred indefinitely**. Container GPU providers (RunPod, Vast.ai) don't grant `CAP_SYS_ADMIN` needed for CRIU. VM providers that support CRIU take 3-5min to boot, negating the ~2s restore benefit.
 
-Focus is on making Tier 2/3 (fast install + progressive loading) as fast as possible on container providers.
+Focus is on making fast install + progressive loading as fast as possible on container providers.
 
 ## Core API
 
@@ -54,12 +54,18 @@ Focus is on making Tier 2/3 (fast install + progressive loading) as fast as poss
 
 ```bash
 # Run with progressive package loading
-zerostart run python serve.py
+zerostart serve.py
 
 # With explicit requirements
-zerostart run -r requirements.txt python serve.py
+zerostart -r requirements.txt serve.py
 
-# Direct wheel installation
+# With inline packages
+zerostart -p torch transformers serve.py
+
+# Pass args to the script
+zerostart serve.py --port 8000
+
+# Direct wheel installation (Rust binary)
 zs-fast-wheel install --wheels <urls> --target <dir>
 
 # Daemon mode (background install, demand-driven)
@@ -68,6 +74,8 @@ zs-fast-wheel daemon --manifest manifest.json
 # Resolve + warm cache
 zs-fast-wheel warm --requirements "torch>=2.0\ntransformers"
 ```
+
+Install: `cd python && pip install -e .`
 
 ### Python SDK
 
@@ -108,9 +116,7 @@ report = remove_hook()  # returns per-package wait times
 
 ## Planning & Tracking
 
-- Private planning/research: `../private-zerostart/`
 - Issue tracking: Beads (`bd list`, `bd show`, `bd ready`)
-- Related: safetensors-streaming (`../safetensors-streaming/`)
 - Parent: gpu-cli (`gpu-cli.sh`)
 
 ## GPU Testing

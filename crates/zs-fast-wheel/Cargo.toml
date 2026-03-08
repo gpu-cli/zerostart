@@ -3,7 +3,7 @@ name = "zs-fast-wheel"
 version = "0.1.0"
 edition = "2024"
 description = "Fast parallel Python wheel downloader + extractor with streaming support"
-license = "Apache-2.0"
+license = "MIT"
 
 [[bin]]
 name = "zs-fast-wheel"

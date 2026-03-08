@@ -1,6 +1,6 @@
 """Orchestrator: resolve → start DaemonHandle → lazy import hook → run user script.
 
-This is the core of `zerostart run python serve.py`. It:
+This is the core of `zerostart <script>`. It:
 1. Resolves requirements via uv pip compile + PyPI JSON
 2. Classifies wheels: small → uv, large → fast-wheel daemon
 3. Creates/reuses a cached venv
@@ -10,8 +10,9 @@ This is the core of `zerostart run python serve.py`. It:
 7. Runs the user's script — imports resolve progressively as packages land
 
 Usage:
-    python -m zerostart.run serve.py
-    python -m zerostart.run -r requirements.txt serve.py
+    zerostart serve.py
+    zerostart -r requirements.txt serve.py
+    zerostart -p torch transformers serve.py
 """
 
 from __future__ import annotations
@@ -218,8 +219,13 @@ def run(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a Python script with progressive package loading")
+    parser = argparse.ArgumentParser(
+        prog="zerostart",
+        description="Run a Python script with progressive package loading",
+        usage="zerostart [-r FILE] [-p PKG ...] [--cache-dir DIR] [-v] <script> [args ...]",
+    )
     parser.add_argument("script", help="Python script to run")
+    parser.add_argument("script_args", nargs=argparse.REMAINDER, help="Arguments passed to the script")
     parser.add_argument("-r", "--requirements", help="Requirements file (default: requirements.txt)")
     parser.add_argument("-p", "--packages", nargs="+", help="Additional packages to install")
     parser.add_argument("--cache-dir", help="Cache directory (default: .zerostart)")
@@ -231,6 +237,9 @@ def main() -> None:
         format="%(asctime)s.%(msecs)03d %(name)-10s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    # Pass script args through via sys.argv so the script sees them
+    sys.argv = [args.script] + args.script_args
 
     run(
         script=args.script,

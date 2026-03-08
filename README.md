@@ -1,159 +1,79 @@
 # zerostart
 
-**2-second cold starts for GPU Python.**
+**Fast cold starts for GPU Python.** Install packages 6-9x faster than pip/uv and start importing before the install finishes.
 
 ```bash
-# First run: installs packages, runs your app, snapshots automatically (~30s)
-zerostart run vllm serve meta-llama/Llama-3-8B
-
-# Second run: restores from snapshot (~2s)
-zerostart run vllm serve meta-llama/Llama-3-8B
+# Install and run — packages load progressively as your app starts
+uvx zerostart serve.py
 ```
 
-No code changes. No platform lock-in. Works on any Linux machine with NVIDIA GPUs.
+No code changes. No platform lock-in. Works on any container GPU provider.
 
 ## The Problem
 
-Every GPU Python cold start pays a tax:
+Every GPU Python cold start wastes minutes on package installation:
 
-| Layer | Time |
-|-------|------|
-| Package install (pip install torch) | 60-180s |
-| Module imports (import torch = 80+ .so files) | 5-15s |
-| Model weight loading | 10-60s |
-| GPU warmup (torch.compile, CUDA graphs) | 5-30s |
-| **Total** | **~2-5 min** |
+| Step | Time |
+|------|------|
+| `pip install torch` (download + extract 800MB wheel) | 60-180s |
+| `pip install transformers tokenizers safetensors ...` | 30-60s |
+| Module imports (`import torch` loads 80+ .so files) | 5-15s |
+| **Total before your code runs** | **~2-5 min** |
+
+On container GPU providers (RunPod, Vast.ai, Lambda), you pay for GPU time during this entire wait.
 
 ## How It Works
 
-zerostart uses a tiered cache — like CPU L1/L2/L3. Each tier is faster but narrower. Miss one, fall through to the next:
+zerostart does two things:
 
-| Tier | What | Cold start |
-|------|------|------------|
-| 0 | GPU snapshot (CRIU + cuda-checkpoint) | **~2s** |
-| 1 | Process snapshot (CRIU, no VRAM) | ~5s |
-| 2 | Cached packages (pre-extracted on volume) | ~10s |
-| 3 | Fast install (uv parallel download+extract) | ~30s |
+1. **Fast parallel install** — downloads and extracts wheels simultaneously across 8 connections, streaming large wheels directly to site-packages with no temp files
+2. **Progressive loading** — your app starts immediately; `import torch` blocks only until torch is extracted, not until everything is done
 
-Every run that misses a tier **builds it for next time**. You don't configure anything — it just gets faster.
+```
+┌─ Your Python app ──────────────────────────────────┐
+│                                                     │
+│  import torch        # blocks 1.3s (873MB wheel)    │
+│  import transformers # blocks 0s (already done)     │
+│  model = load(...)   # runs while deps still land   │
+│                                                     │
+│  ┌─ zs-fast-wheel (Rust, in-process) ────────────┐  │
+│  │  downloading:  ████████░░ tokenizers           │  │
+│  │  extracting:   ██████████ torch ✓              │  │
+│  │  queued:       safetensors, triton, ...        │  │
+│  └────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+```
+
+When your code hits `import torch`, the daemon reprioritizes torch to the front of the queue. Your app runs in parallel with the install — not after it.
 
 ## Quick Start
 
 ```bash
-# Install
-curl -sSL https://github.com/gpu-cli/zerostart/releases/latest/download/install.sh | bash
+# Run any Python script with progressive loading
+uvx zerostart serve.py
 
-# Check your system
-zerostart doctor
+# With explicit requirements
+uvx zerostart -r requirements.txt serve.py
 
-# Run any Python app
-zerostart run python serve.py
+# With inline packages
+uvx zerostart -p torch transformers serve.py
 
-# Run vLLM, SGLang, ComfyUI — anything
-zerostart run vllm serve meta-llama/Llama-3-8B
+# Pass args to your script
+uvx zerostart serve.py --port 8000
 ```
 
-## Ready Detection
-
-zerostart needs to know when your app is initialized. By default, it figures this out automatically:
-
-1. **Port binding** — detects when your server starts listening
-2. **Health probes** — probes `/health`, `/v1/models`, `/ready`
-3. **GPU stabilization** — watches VRAM allocations settle
-
-For explicit control:
+Or install it:
 
 ```bash
-# Poll a specific health endpoint
-zerostart run --ready=url:http://localhost:8000/health python serve.py
-
-# Wait for a file touch (any language, no SDK needed)
-zerostart run --ready=signal python train.py
-# In your app: touch /tmp/zerostart/ready
-```
-
-### Python SDK (optional)
-
-For precise snapshot control, add one line:
-
-```python
-import zerostart
-zerostart.ready()  # snapshot happens here
-```
-
-If zerostart isn't installed or you're not running under the orchestrator, `ready()` is a no-op. Safe to leave in production code.
-
-## Snapshot Modes
-
-```bash
-# Full GPU snapshot (default for GPU apps — includes VRAM)
-zerostart run --snapshot=gpu python serve.py
-
-# Process-only (skip VRAM — load model fresh from disk or network)
-zerostart run --snapshot=process python serve.py
-
-# No snapshots (just fast package install + caching)
-zerostart run --snapshot=off python serve.py
-```
-
-## Snapshot Management
-
-```bash
-# List cached snapshots
-zerostart list
-
-# Inspect details
-zerostart inspect <key>
-
-# Pre-warm (build snapshot without serving)
-zerostart warm vllm serve model
-
-# Garbage collect
-zerostart gc --max-age=7d --max-size=50G
-
-# Delete specific snapshot
-zerostart delete <key>
-```
-
-## gpu-cli Integration
-
-If you use [gpu-cli](https://gpu-cli.sh), add one line to `gpu.jsonc`:
-
-```jsonc
-{
-  "zerostart": true
-}
-```
-
-gpu-cli automatically wraps your commands with zerostart. Your second `gpu run` is instant.
-
-## Requirements
-
-- Linux (kernel 3.11+)
-- NVIDIA GPU with driver r550+
-- CRIU 4.0+ (`apt install criu`)
-- cuda-checkpoint ([NVIDIA/cuda-checkpoint](https://github.com/NVIDIA/cuda-checkpoint))
-
-On macOS: zerostart gracefully degrades — runs your app normally without snapshots.
-
-## Testing on Real GPUs
-
-Build locally with cross-compilation to avoid burning GPU time on compilation, then use [gpu-cli](https://gpu-cli.sh) to test on real NVIDIA GPUs:
-
-```bash
-# Cross-compile locally for Linux
-cargo build --target x86_64-unknown-linux-gnu --release
-
-# Test on a real GPU (binary synced automatically)
-gpu run "zerostart doctor"
-gpu run "zerostart run python serve.py"
+pip install zerostart
+zerostart serve.py
 ```
 
 ## Benchmarks
 
-Measured on an RTX 4090 pod, comparing `uv pip install` (current fastest Python installer) against `zs-fast-wheel warm` (zerostart's progressive wheel installer):
+Measured on an RTX 4090 pod (RunPod), comparing `uv pip install` against `zs-fast-wheel`:
 
-### Package Install Speed
+### Install Speed
 
 | Workload | Packages | Size | uv pip install | zs-fast-wheel | Speedup |
 |----------|----------|------|---------------|---------------|---------|
@@ -161,30 +81,31 @@ Measured on an RTX 4090 pod, comparing `uv pip install` (current fastest Python 
 | Medium (numpy, pandas, scikit-learn) | 19 wheels | 251 MB | 12.0s | 1.3s | **9.3x** |
 | ML (torch, transformers, triton + CUDA) | 56 wheels | 7 GB | 97.8s | 16.2s | **6.0x** |
 
-For small packages there's no difference — the bottleneck is resolution, not download. For real ML stacks (hundreds of MB to multiple GB), zs-fast-wheel is **6-9x faster** than uv because it streams and extracts in parallel instead of download-then-extract.
+For small packages there's no difference. For real ML stacks (hundreds of MB to GB), zs-fast-wheel is **6-9x faster** because it streams and extracts in parallel instead of download-then-extract.
 
-### Progressive Loading
+### Time to First Import
 
-zs-fast-wheel supports **progressive loading** — Python can start importing packages while the rest are still downloading. On the same RTX 4090 pod:
+With progressive loading, your code doesn't wait for the full install:
 
 | Package | Size | Time to first import |
 |---------|------|---------------------|
 | numpy | 16 MB | 0.2s |
-| safetensors | 0.5 MB | 5.2s (queued behind large wheels) |
 | torch | 873 MB | 1.3s (demand-prioritized) |
+| safetensors | 0.5 MB | 5.2s (queued behind large wheels) |
 
-With demand signaling, `import torch` completes in **1.3 seconds** even though the full 7GB ML stack takes 16s to install. Your code starts running before the install finishes.
+`import torch` completes in **1.3 seconds** even though the full 7GB ML stack takes 16s to install.
 
-### How It Works
+## How It Works (Details)
 
 1. **Parallel streaming** — downloads and extracts wheels simultaneously across 8 connections
 2. **Demand signaling** — when Python hits `import torch`, the daemon reprioritizes torch to the front of the queue
-3. **Streaming extraction** — large wheels (>50MB) use HTTP Range requests to extract while downloading
+3. **Streaming extraction** — large wheels (>50MB) start extracting before the full download completes
 4. **No temp files** — wheels extract directly to site-packages, no intermediate copies
+5. **Lazy import hook** — a `sys.meta_path` finder that gates imports until the package is on disk, then lets normal Python machinery do the loading
 
-## Architecture: zs-fast-wheel
+### Architecture
 
-The package install layer is a standalone Rust binary + PyO3 module called `zs-fast-wheel`. It can be used independently of the rest of zerostart.
+The core is `zs-fast-wheel`, a Rust binary + PyO3 module:
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -210,25 +131,34 @@ The package install layer is a standalone Rust binary + PyO3 module called `zs-f
 
 Key design decisions:
 
-- **Pure `std::sync` for cross-runtime safety** — the DaemonEngine uses `Mutex` + `Condvar` (not tokio sync primitives) so `wait_done()` works correctly when the PyO3 caller and the download tokio runtime are on separate threads. This was a critical bug fix — `tokio::sync::watch` channels silently hang when polled from a different runtime.
-- **In-process via PyO3** — no subprocess, no IPC, no sockets. The Rust engine runs as a native Python extension. `signal_demand()` and `wait_done()` are direct function calls with ~0 overhead.
+- **In-process via PyO3** — no subprocess, no IPC, no sockets. The Rust engine runs as a native Python extension. `signal_demand()` and `wait_done()` are direct function calls.
+- **`std::sync` for cross-runtime safety** — uses `Mutex` + `Condvar` (not tokio sync) so `wait_done()` works correctly across threads.
 - **Atomic extraction** — each wheel extracts to a staging directory, then atomically renames into site-packages. Partial extractions never corrupt the target.
-- **Streaming for large wheels** — wheels >50MB use HTTP Range requests to start extracting before the full download completes.
 
-## How It Compares
+## Environment Caching
 
-| | Modal | zerostart |
-|---|---|---|
-| Cold start | ~2s | ~2s |
-| Code changes | Rewrite as Modal class | None (or 1 line) |
-| Platform | Modal only | Any Linux + NVIDIA GPU |
-| Open source | No | Yes (Apache 2.0) |
-| GPU snapshots | Proprietary | NVIDIA cuda-checkpoint (open) |
-| Pricing | Per-second compute | Free |
+zerostart caches completed environments in `.zerostart/`. If the same requirements are resolved again, it reuses the cached environment (~0s install). The cache key is a hash of the resolved artifact set.
+
+## Requirements
+
+- Python 3.10+
+- Linux (container GPU providers: RunPod, Vast.ai, Lambda, etc.)
+- `uv` for requirement resolution (pre-installed on most GPU containers)
+
+On macOS: zerostart runs your script directly without progressive loading (useful for development).
+
+## gpu-cli Integration
+
+If you use [gpu-cli](https://gpu-cli.sh):
+
+```bash
+# Your script runs with progressive loading on a GPU pod
+gpu run "uvx zerostart serve.py"
+```
 
 ## License
 
-Apache 2.0
+MIT
 
 ---
 
