@@ -16,6 +16,7 @@ echo "=== zerostart GPU Test Runner ==="
 echo "Date: $(date)"
 echo "Python: $(python3 --version)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
+echo "Disk: $(df -h /tmp | tail -1 | awk '{print $4 " free"}')"
 echo ""
 
 # --- Setup ---
@@ -51,6 +52,13 @@ echo "zerostart installed: $(which zerostart)"
 
 # Verify imports
 python3 -c "import zerostart; import zs_fast_wheel; print('imports ok')"
+
+# Shared cache dir — reuse across tests to save disk
+CACHE=/tmp/zs_cache
+rm -rf "$CACHE"
+
+# Cleanup helper
+cleanup_cache() { rm -rf "$CACHE"; }
 
 echo ""
 echo "=== 1. Basic Functionality ==="
@@ -301,8 +309,8 @@ assert requests.__version__ == "2.31.0", f"expected requests 2.31.0, got {reques
 print(f"numpy={np.__version__} requests={requests.__version__} — versions correct")
 PYEOF
 echo -e 'numpy==1.26.4\nrequests==2.31.0' > /tmp/reqs_pinned.txt
-rm -rf /tmp/zs_cache_pinned
-if zerostart -r /tmp/reqs_pinned.txt --cache-dir /tmp/zs_cache_pinned /tmp/test_pinned.py 2>&1; then
+rm -rf /tmp/zs_t_pinned
+if zerostart -r /tmp/reqs_pinned.txt --cache-dir /tmp/zs_t_pinned /tmp/test_pinned.py 2>&1; then
     pass "3.1 pinned versions"
 else
     fail "3.1 pinned versions" "exit $?"
@@ -311,7 +319,7 @@ fi
 # --- 3.2 Version upgrade — cache invalidation ---
 echo ""
 echo "--- 3.2 Version upgrade cache invalidation ---"
-rm -rf /tmp/zs_cache_upgrade
+rm -rf /tmp/zs_t_upgrade
 
 # Run 1: numpy 1.26.4
 echo 'numpy==1.26.4' > /tmp/reqs_v1.txt
@@ -320,8 +328,8 @@ import numpy as np
 print(f"v1: numpy={np.__version__}")
 assert np.__version__ == "1.26.4"
 PYEOF
-zerostart -r /tmp/reqs_v1.txt --cache-dir /tmp/zs_cache_upgrade /tmp/test_v1.py 2>&1
-ENVS_AFTER_V1=$(ls /tmp/zs_cache_upgrade/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_v1.txt --cache-dir /tmp/zs_t_upgrade /tmp/test_v1.py 2>&1
+ENVS_AFTER_V1=$(ls /tmp/zs_t_upgrade/envs/ 2>/dev/null | wc -l)
 
 # Run 2: numpy 1.26.3 (different version)
 echo 'numpy==1.26.3' > /tmp/reqs_v2.txt
@@ -330,8 +338,8 @@ import numpy as np
 print(f"v2: numpy={np.__version__}")
 assert np.__version__ == "1.26.3"
 PYEOF
-zerostart -r /tmp/reqs_v2.txt --cache-dir /tmp/zs_cache_upgrade /tmp/test_v2.py 2>&1
-ENVS_AFTER_V2=$(ls /tmp/zs_cache_upgrade/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_v2.txt --cache-dir /tmp/zs_t_upgrade /tmp/test_v2.py 2>&1
+ENVS_AFTER_V2=$(ls /tmp/zs_t_upgrade/envs/ 2>/dev/null | wc -l)
 
 if [ "$ENVS_AFTER_V2" -gt "$ENVS_AFTER_V1" ]; then
     pass "3.2 version upgrade creates new cache"
@@ -342,20 +350,20 @@ fi
 # --- 3.3 Adding a package ---
 echo ""
 echo "--- 3.3 Adding a package to requirements ---"
-rm -rf /tmp/zs_cache_add
+rm -rf /tmp/zs_t_add
 
 echo 'six' > /tmp/reqs_add1.txt
 echo 'import six; print(f"six={six.__version__}")' > /tmp/test_add.py
-zerostart -r /tmp/reqs_add1.txt --cache-dir /tmp/zs_cache_add /tmp/test_add.py 2>&1
-ENVS_1=$(ls /tmp/zs_cache_add/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_add1.txt --cache-dir /tmp/zs_t_add /tmp/test_add.py 2>&1
+ENVS_1=$(ls /tmp/zs_t_add/envs/ 2>/dev/null | wc -l)
 
 echo -e 'six\nidna' > /tmp/reqs_add2.txt
 cat > /tmp/test_add2.py << 'PYEOF'
 import six, idna
 print(f"six={six.__version__} idna={idna.__version__}")
 PYEOF
-zerostart -r /tmp/reqs_add2.txt --cache-dir /tmp/zs_cache_add /tmp/test_add2.py 2>&1
-ENVS_2=$(ls /tmp/zs_cache_add/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_add2.txt --cache-dir /tmp/zs_t_add /tmp/test_add2.py 2>&1
+ENVS_2=$(ls /tmp/zs_t_add/envs/ 2>/dev/null | wc -l)
 
 if [ "$ENVS_2" -gt "$ENVS_1" ]; then
     pass "3.3 adding package creates new cache"
@@ -366,19 +374,19 @@ fi
 # --- 3.4 Warm cache hit ---
 echo ""
 echo "--- 3.4 Warm cache hit ---"
-rm -rf /tmp/zs_cache_warm
+rm -rf /tmp/zs_t_warm
 echo 'import six; print(f"six={six.__version__}")' > /tmp/test_warm.py
 echo 'six' > /tmp/reqs_warm.txt
 
 # Cold run
 T0=$(date +%s%N)
-zerostart -r /tmp/reqs_warm.txt --cache-dir /tmp/zs_cache_warm /tmp/test_warm.py 2>&1
+zerostart -r /tmp/reqs_warm.txt --cache-dir /tmp/zs_t_warm /tmp/test_warm.py 2>&1
 T1=$(date +%s%N)
 COLD_MS=$(( (T1 - T0) / 1000000 ))
 
 # Warm run
 T0=$(date +%s%N)
-zerostart -r /tmp/reqs_warm.txt --cache-dir /tmp/zs_cache_warm /tmp/test_warm.py 2>&1
+zerostart -r /tmp/reqs_warm.txt --cache-dir /tmp/zs_t_warm /tmp/test_warm.py 2>&1
 T1=$(date +%s%N)
 WARM_MS=$(( (T1 - T0) / 1000000 ))
 
@@ -388,6 +396,9 @@ if [ "$WARM_MS" -lt "$COLD_MS" ]; then
 else
     fail "3.4 warm cache" "warm (${WARM_MS}ms) not faster than cold (${COLD_MS}ms)"
 fi
+
+# Clean up version test caches to reclaim disk before heavy tests
+rm -rf /tmp/zs_t_pinned /tmp/zs_t_upgrade /tmp/zs_t_add /tmp/zs_t_warm
 
 echo ""
 echo "=== 4. Progressive Loading ==="
@@ -409,8 +420,8 @@ print(f"torch import: {t_torch:.2f}s")
 print(f"numpy import: {t_numpy:.2f}s")
 print(f"torch: {torch.__version__}, cuda: {torch.cuda.is_available()}")
 PYEOF
-rm -rf /tmp/zs_cache_prog
-if zerostart -p torch -p numpy --cache-dir /tmp/zs_cache_prog /tmp/test_progressive.py 2>&1; then
+cleanup_cache
+if zerostart -p torch -p numpy --cache-dir "$CACHE" /tmp/test_progressive.py 2>&1; then
     pass "4.1 progressive loading"
 else
     fail "4.1 progressive loading" "exit $?"
@@ -426,8 +437,8 @@ import torch.nn.functional as F
 from torch import Tensor
 print(f"torch={torch.__version__} nn={torch.nn} F={F}")
 PYEOF
-rm -rf /tmp/zs_cache_submod
-if zerostart -p torch --cache-dir /tmp/zs_cache_submod /tmp/test_submod.py 2>&1; then
+cleanup_cache
+if zerostart -p torch --cache-dir "$CACHE" /tmp/test_submod.py 2>&1; then
     pass "4.2 submodule imports"
 else
     fail "4.2 submodule imports" "exit $?"
@@ -450,8 +461,8 @@ print(f"flash_attn import took {elapsed:.1f}s, available: {HAS_FLASH}")
 assert elapsed < 10, f"speculative import took too long: {elapsed:.1f}s"
 print("speculative timeout ok")
 PYEOF
-rm -rf /tmp/zs_cache_spec
-if zerostart -p torch --cache-dir /tmp/zs_cache_spec /tmp/test_speculative.py 2>&1; then
+cleanup_cache
+if zerostart -p torch --cache-dir "$CACHE" /tmp/test_speculative.py 2>&1; then
     pass "4.3 speculative imports"
 else
     fail "4.3 speculative imports" "exit $?"
@@ -502,8 +513,8 @@ result = pipe("Hello, I am", max_new_tokens=20)
 print(result[0]["generated_text"])
 print("HF pipeline ok")
 PYEOF
-rm -rf /tmp/zs_cache_hf
-if timeout 300 zerostart -p torch -p transformers -p accelerate --cache-dir /tmp/zs_cache_hf /tmp/test_hf.py 2>&1; then
+cleanup_cache
+if timeout 300 zerostart -p torch -p transformers -p accelerate --cache-dir "$CACHE" /tmp/test_hf.py 2>&1; then
     pass "6.1 HuggingFace pipeline"
 else
     fail "6.1 HuggingFace pipeline" "exit $?"
@@ -530,8 +541,8 @@ for i in range(10):
 
 print(f"Training complete. Final loss: {loss.item():.4f}")
 PYEOF
-rm -rf /tmp/zs_cache_train
-if zerostart -p torch --cache-dir /tmp/zs_cache_train /tmp/test_train.py 2>&1; then
+cleanup_cache
+if zerostart -p torch --cache-dir "$CACHE" /tmp/test_train.py 2>&1; then
     pass "6.2 training loop"
 else
     fail "6.2 training loop" "exit $?"
@@ -554,8 +565,8 @@ def predict():
 print(f"torch: {torch.__version__}, cuda: {torch.cuda.is_available()}")
 print("FastAPI app created ok")
 PYEOF
-rm -rf /tmp/zs_cache_api
-if zerostart -p torch -p fastapi -p uvicorn --cache-dir /tmp/zs_cache_api /tmp/test_api.py 2>&1; then
+cleanup_cache
+if zerostart -p torch -p fastapi -p uvicorn --cache-dir "$CACHE" /tmp/test_api.py 2>&1; then
     pass "6.3 FastAPI + torch"
 else
     fail "6.3 FastAPI + torch" "exit $?"
@@ -571,8 +582,8 @@ df = pd.DataFrame(np.random.randn(1000, 4), columns=list("ABCD"))
 print(f"Shape: {df.shape}")
 print(f"Mean A: {df['A'].mean():.4f}")
 PYEOF
-rm -rf /tmp/zs_cache_data
-if zerostart -p pandas -p numpy --cache-dir /tmp/zs_cache_data /tmp/test_data.py 2>&1; then
+cleanup_cache
+if zerostart -p pandas -p numpy --cache-dir "$CACHE" /tmp/test_data.py 2>&1; then
     pass "6.4 data processing"
 else
     fail "6.4 data processing" "exit $?"
@@ -602,8 +613,8 @@ print(f"tensor shape: {x.shape}, device: {x.device}")
 print(f"config: {config}")
 print("PEP 723 real-world ok")
 PYEOF
-rm -rf /tmp/zs_cache_pep723
-if zerostart --cache-dir /tmp/zs_cache_pep723 /tmp/test_pep723_real.py 2>&1; then
+cleanup_cache
+if zerostart --cache-dir "$CACHE" /tmp/test_pep723_real.py 2>&1; then
     pass "6.5 PEP 723 real-world"
 else
     fail "6.5 PEP 723 real-world" "exit $?"
