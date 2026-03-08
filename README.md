@@ -52,6 +52,9 @@ When your code hits `import torch`, the daemon reprioritizes torch to the front 
 # Run any Python script with progressive loading
 uvx zerostart serve.py
 
+# PEP 723 inline deps — just works (reads from script header)
+uvx zerostart serve.py
+
 # With explicit requirements
 uvx zerostart -r requirements.txt serve.py
 
@@ -60,6 +63,26 @@ uvx zerostart -p torch transformers serve.py
 
 # Pass args to your script
 uvx zerostart serve.py --port 8000
+```
+
+### PEP 723 Inline Script Metadata
+
+Embed dependencies directly in your script — no `requirements.txt` needed:
+
+```python
+# /// script
+# dependencies = ["torch>=2.0", "transformers", "safetensors"]
+# ///
+
+import torch
+from transformers import AutoModel
+
+model = AutoModel.from_pretrained("bert-base-uncased")
+print(f"Loaded on {model.device}")
+```
+
+```bash
+uvx zerostart serve.py  # deps auto-detected from script
 ```
 
 Or install it:

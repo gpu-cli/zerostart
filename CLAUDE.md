@@ -56,6 +56,9 @@ Focus is on making fast install + progressive loading as fast as possible on con
 # Run with progressive package loading
 zerostart serve.py
 
+# PEP 723 inline deps (# /// script block) — auto-detected
+zerostart serve.py  # reads deps from script header
+
 # With explicit requirements
 zerostart -r requirements.txt serve.py
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -47,6 +48,54 @@ def parse_requirements(path: str) -> list[str]:
                 continue
             reqs.append(line)
     return reqs
+
+
+def parse_inline_metadata(script: str) -> list[str]:
+    """Parse PEP 723 inline script metadata from a Python script.
+
+    Looks for a block like:
+        # /// script
+        # dependencies = ["torch", "transformers>=4.0"]
+        # ///
+
+    Returns list of dependency specifiers, or empty list if none found.
+    """
+    try:
+        with open(script) as f:
+            content = f.read()
+    except (FileNotFoundError, PermissionError):
+        return []
+
+    # Match the /// script ... /// block (PEP 723 format)
+    pattern = r'(?m)^# /// script\s*\n((?:#[^\n]*\n)*)# ///'
+    match = re.search(pattern, content)
+    if not match:
+        return []
+
+    # Strip leading "# " from each line to get TOML content
+    block = match.group(1)
+    toml_lines = []
+    for line in block.splitlines():
+        # Remove leading "# " or "#"
+        stripped = re.sub(r'^#\s?', '', line)
+        toml_lines.append(stripped)
+    toml_content = '\n'.join(toml_lines)
+
+    # Parse the dependencies array from TOML-like content
+    # Full TOML parsing is overkill — just extract the dependencies list
+    deps_match = re.search(
+        r'dependencies\s*=\s*\[(.*?)\]',
+        toml_content,
+        re.DOTALL,
+    )
+    if not deps_match:
+        return []
+
+    # Extract quoted strings from the array
+    raw = deps_match.group(1)
+    matches = re.findall(r'"([^"]+)"|\'([^\']+)\'', raw)
+    # re.findall with alternation returns tuples — take whichever group matched
+    return [double or single for double, single in matches]
 
 
 def _install_uv_wheels(
@@ -121,13 +170,21 @@ def run(
     cache_dir: str | None = None,
 ) -> None:
     """Run a Python script with lazy imports and progressive installation."""
-    # Parse requirements
+    # Parse requirements from (in priority order):
+    # 1. Explicit -p packages or -r file
+    # 2. PEP 723 inline script metadata (# /// script)
+    # 3. requirements.txt in current directory
     if requirements is None:
         requirements = []
     if requirements_file:
         requirements.extend(parse_requirements(requirements_file))
-    elif not requirements and Path("requirements.txt").exists():
-        requirements = parse_requirements("requirements.txt")
+    elif not requirements:
+        inline = parse_inline_metadata(script)
+        if inline:
+            log.info("Found PEP 723 inline dependencies: %s", inline)
+            requirements.extend(inline)
+        elif Path("requirements.txt").exists():
+            requirements = parse_requirements("requirements.txt")
 
     if not requirements:
         log.warning("No requirements found — running script directly")

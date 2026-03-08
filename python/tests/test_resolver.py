@@ -18,6 +18,7 @@ from zerostart.resolver import (
     resolve_requirements,
 )
 from zerostart.cache import EnvironmentCache, CachedEnv
+from zerostart.run import parse_inline_metadata
 
 
 def test_artifact_plan_classification():
@@ -202,6 +203,111 @@ def test_resolve_real_packages():
         assert a.size > 0
 
 
+def test_inline_metadata_basic():
+    """Parse PEP 723 inline script metadata."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write('''\
+# /// script
+# dependencies = ["torch", "transformers>=4.0"]
+# ///
+
+import torch
+print(torch.__version__)
+''')
+        f.flush()
+        deps = parse_inline_metadata(f.name)
+    Path(f.name).unlink()
+    assert deps == ["torch", "transformers>=4.0"]
+
+
+def test_inline_metadata_single_quotes():
+    """Parse inline metadata with single-quoted strings."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write("""\
+# /// script
+# dependencies = ['requests', 'flask>=2.0']
+# ///
+
+import requests
+""")
+        f.flush()
+        deps = parse_inline_metadata(f.name)
+    Path(f.name).unlink()
+    assert deps == ["requests", "flask>=2.0"]
+
+
+def test_inline_metadata_multiline():
+    """Parse inline metadata with deps on separate lines."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write('''\
+# /// script
+# dependencies = [
+#     "torch>=2.0",
+#     "numpy",
+#     "pyyaml",
+# ]
+# ///
+
+print("hello")
+''')
+        f.flush()
+        deps = parse_inline_metadata(f.name)
+    Path(f.name).unlink()
+    assert deps == ["torch>=2.0", "numpy", "pyyaml"]
+
+
+def test_inline_metadata_none():
+    """Script without inline metadata returns empty list."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write('print("hello")\n')
+        f.flush()
+        deps = parse_inline_metadata(f.name)
+    Path(f.name).unlink()
+    assert deps == []
+
+
+def test_inline_metadata_no_dependencies():
+    """Script block without dependencies key returns empty list."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write('''\
+# /// script
+# requires-python = ">=3.10"
+# ///
+
+print("hello")
+''')
+        f.flush()
+        deps = parse_inline_metadata(f.name)
+    Path(f.name).unlink()
+    assert deps == []
+
+
+def test_inline_metadata_missing_file():
+    """Non-existent file returns empty list."""
+    deps = parse_inline_metadata("/tmp/nonexistent_script_xyz.py")
+    assert deps == []
+
+
+def test_inline_metadata_mixed_with_other_comments():
+    """Inline metadata parsed correctly when other comments present."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+        f.write('''\
+#!/usr/bin/env python3
+# This is my script
+
+# /// script
+# dependencies = ["requests"]
+# ///
+
+# More comments here
+import requests
+''')
+        f.flush()
+        deps = parse_inline_metadata(f.name)
+    Path(f.name).unlink()
+    assert deps == ["requests"]
+
+
 if __name__ == "__main__":
     tests = [
         test_artifact_plan_classification,
@@ -215,6 +321,13 @@ if __name__ == "__main__":
         test_env_cache_complete,
         test_resolve_empty,
         test_resolve_real_packages,
+        test_inline_metadata_basic,
+        test_inline_metadata_single_quotes,
+        test_inline_metadata_multiline,
+        test_inline_metadata_none,
+        test_inline_metadata_no_dependencies,
+        test_inline_metadata_missing_file,
+        test_inline_metadata_mixed_with_other_comments,
     ]
 
     passed = 0
