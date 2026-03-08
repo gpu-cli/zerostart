@@ -29,12 +29,17 @@ done
 cd /workspace/zerostart 2>/dev/null || cd "$(dirname "$0")/.."
 echo "project root: $(pwd)"
 
+# Create a fresh venv (the synced .venv has macOS python which breaks maturin)
+echo "Creating fresh venv..."
+rm -rf /tmp/zs-venv
+python3 -m venv /tmp/zs-venv
+source /tmp/zs-venv/bin/activate
+pip install maturin 2>&1 | tail -1
+
 # Build PyO3 module first (zs-fast-wheel must exist before zerostart can import it)
-# Use system python, not the synced macOS .venv
-SYSTEM_PYTHON=$(which python3)
-echo "Building zs-fast-wheel PyO3 module (python: $SYSTEM_PYTHON)..."
+echo "Building zs-fast-wheel PyO3 module..."
 cd crates/zs-fast-wheel
-maturin develop --release --interpreter "$SYSTEM_PYTHON" 2>&1 | tail -3
+maturin develop --release 2>&1 | tail -3
 cd ../..
 echo "zs_fast_wheel built"
 
