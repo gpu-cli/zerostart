@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "zs-fast-wheel",
+    "zs-snapshot",
 ]
 
 [workspace.package]

@@ -6,6 +6,7 @@
     { "type": "RTX A6000" }
   ],
   "min_vram": 24,
+  "include": ["bin/"],
   "outputs": ["benches/results/"],
   "environment": {
     "system": {
@@ -15,7 +16,7 @@
       "steps": [
         { "run": "curl -LsSf https://astral.sh/uv/install.sh | sh" },
         { "run": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" },
-        { "run": "chmod +x bin/zs-fast-wheel-linux-x86_64" },
+        { "run": "chmod +x bin/*-linux-x86_64" },
         { "run": "pip install maturin patchelf pytest" }
       ]
     }
