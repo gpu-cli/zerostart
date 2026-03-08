@@ -20,6 +20,11 @@ echo ""
 # --- Setup ---
 echo "--- Setup ---"
 
+# Source cargo env (rustup installs to non-standard paths on GPU pods)
+for p in "$HOME/.cargo/env" "/gpu-cli-workspaces/.cache/cargo/env"; do
+    [ -f "$p" ] && source "$p"
+done
+
 # Navigate to project root
 cd /workspace/zerostart 2>/dev/null || cd "$(dirname "$0")/.."
 echo "project root: $(pwd)"
