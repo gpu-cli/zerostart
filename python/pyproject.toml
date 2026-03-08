@@ -7,9 +7,6 @@ name = "zerostart"
 version = "0.1.0"
 description = "Progressive package loading for GPU Python apps"
 requires-python = ">=3.10"
-dependencies = [
-    "zs-fast-wheel>=0.1.0",
-]
 
 [project.scripts]
 zerostart = "zerostart.run:main"

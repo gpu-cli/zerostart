@@ -20,17 +20,21 @@ echo ""
 # --- Setup ---
 echo "--- Setup ---"
 
-# Install zerostart from source
+# Navigate to project root
 cd /workspace/zerostart 2>/dev/null || cd "$(dirname "$0")/.."
-pip install -e python/ 2>&1 | tail -1
-echo "zerostart installed: $(which zerostart)"
+echo "project root: $(pwd)"
 
-# Build PyO3 module
+# Build PyO3 module first (zs-fast-wheel must exist before zerostart can import it)
+echo "Building zs-fast-wheel PyO3 module..."
 cd crates/zs-fast-wheel
-pip install maturin 2>&1 | tail -1
-maturin develop --release 2>&1 | tail -1
+maturin develop --release 2>&1 | tail -3
 cd ../..
 echo "zs_fast_wheel built"
+
+# Install zerostart from source
+echo "Installing zerostart..."
+pip install -e python/ 2>&1 | tail -1
+echo "zerostart installed: $(which zerostart)"
 
 # Verify imports
 python3 -c "import zerostart; import zs_fast_wheel; print('imports ok')"
