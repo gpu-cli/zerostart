@@ -14,6 +14,8 @@
     "shell": {
       "steps": [
         { "run": "curl -LsSf https://astral.sh/uv/install.sh | sh" },
+        { "run": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" },
+        { "run": "curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /root/.cargo/bin" },
         { "run": "chmod +x bin/zs-fast-wheel-linux-x86_64" }
       ]
     }

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use crate::extract::ExtractStats;
+use crate::extract::{commit_staged, ExtractStats};
 
 /// A parsed entry from the zip central directory
 #[derive(Debug, Clone)]
@@ -490,6 +490,37 @@ fn parse_central_directory(data: &[u8]) -> Result<Vec<ZipEntry>> {
     }
 
     Ok(entries)
+}
+
+/// Stream-extract a wheel atomically: extract to staging dir, then commit into place.
+///
+/// Same as `stream_extract_wheel` but ensures site-packages never sees partial state.
+pub async fn stream_extract_wheel_atomic(
+    client: &Client,
+    url: &str,
+    site_packages: &Path,
+    pkg_name: &str,
+    parallel: usize,
+    stats: &Arc<ExtractStats>,
+) -> Result<(u64, u64)> {
+    let suffix = {
+        use rand::Rng;
+        format!("{:08x}", rand::thread_rng().r#gen::<u32>())
+    };
+    let staging = site_packages.join(format!(".installing-{}-{}", pkg_name, suffix));
+    fs::create_dir_all(&staging)?;
+
+    let result = stream_extract_wheel(client, url, &staging, parallel, stats).await;
+    match result {
+        Ok(totals) => {
+            commit_staged(&staging, site_packages)?;
+            Ok(totals)
+        }
+        Err(e) => {
+            let _ = fs::remove_dir_all(&staging);
+            Err(e)
+        }
+    }
 }
 
 fn parse_zip64_extra(

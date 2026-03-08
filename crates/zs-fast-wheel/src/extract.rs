@@ -280,3 +280,203 @@ fn set_permissions(dest: &Path) {
 
 #[cfg(not(unix))]
 fn set_permissions(_dest: &Path) {}
+
+/// Generate a random suffix for staging directories
+fn random_suffix() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    format!("{:08x}", rng.r#gen::<u32>())
+}
+
+/// Extract a wheel atomically: extract to staging dir, then rename into place.
+///
+/// This ensures that site-packages never contains a half-extracted wheel.
+/// The import hook treats `done/{distribution}` as the readiness signal,
+/// but atomic commit also prevents `find_spec()` from seeing partial state.
+pub fn extract_wheel_atomic(
+    wheel_path: &Path,
+    site_packages: &Path,
+    pkg_name: &str,
+    threads: usize,
+    use_fallocate: bool,
+    stats: &Arc<ExtractStats>,
+) -> Result<()> {
+    let staging = site_packages.join(format!(".installing-{}-{}", pkg_name, random_suffix()));
+    fs::create_dir_all(&staging)?;
+
+    // Extract into staging dir
+    let result = extract_wheel(wheel_path, &staging, threads, use_fallocate, stats);
+    if let Err(e) = result {
+        // Clean up staging on failure
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    // Commit: move each top-level entry from staging into site-packages
+    commit_staged(&staging, site_packages)?;
+
+    Ok(())
+}
+
+/// Move all top-level entries from staging dir into site-packages, then remove staging.
+pub fn commit_staged(staging: &Path, site_packages: &Path) -> Result<()> {
+    for entry in fs::read_dir(staging)? {
+        let entry = entry?;
+        let dest = site_packages.join(entry.file_name());
+        if dest.exists() {
+            anyhow::bail!("refusing to overwrite existing path: {}", dest.display());
+        }
+        fs::rename(entry.path(), &dest).with_context(|| {
+            format!(
+                "failed to commit {} → {}",
+                entry.path().display(),
+                dest.display()
+            )
+        })?;
+    }
+    fs::remove_dir(staging)?;
+    Ok(())
+}
+
+/// Clean up stale staging directories from interrupted runs.
+pub fn cleanup_stale_staging(site_packages: &Path) -> Result<()> {
+    if !site_packages.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(site_packages)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(".installing-") {
+            tracing::warn!("removing stale staging dir: {}", entry.path().display());
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    /// Create a minimal valid .whl (zip) file with a single file inside
+    fn create_test_wheel(dir: &Path, pkg_name: &str) -> PathBuf {
+        let wheel_path = dir.join(format!("{pkg_name}-1.0.0-py3-none-any.whl"));
+        let file = File::create(&wheel_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+
+        // Add a Python file
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip.start_file(format!("{pkg_name}/__init__.py"), options)
+            .unwrap();
+        zip.write_all(b"# test package\n").unwrap();
+
+        // Add dist-info METADATA
+        zip.start_file(
+            format!("{pkg_name}-1.0.0.dist-info/METADATA"),
+            options,
+        )
+        .unwrap();
+        zip.write_all(format!("Name: {pkg_name}\nVersion: 1.0.0\n").as_bytes())
+            .unwrap();
+
+        zip.finish().unwrap();
+        wheel_path
+    }
+
+    #[test]
+    fn test_extract_wheel_atomic_success() {
+        let tmp = TempDir::new().unwrap();
+        let wheels_dir = tmp.path().join("wheels");
+        let site_packages = tmp.path().join("site-packages");
+        fs::create_dir_all(&wheels_dir).unwrap();
+        fs::create_dir_all(&site_packages).unwrap();
+
+        let wheel = create_test_wheel(&wheels_dir, "mypkg");
+        let stats = Arc::new(ExtractStats::default());
+
+        extract_wheel_atomic(&wheel, &site_packages, "mypkg", 1, false, &stats).unwrap();
+
+        // Package should be in site-packages
+        assert!(site_packages.join("mypkg/__init__.py").exists());
+        assert!(site_packages.join("mypkg-1.0.0.dist-info/METADATA").exists());
+
+        // No staging dirs left
+        let staging_dirs: Vec<_> = fs::read_dir(&site_packages)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".installing-"))
+            .collect();
+        assert!(staging_dirs.is_empty());
+    }
+
+    #[test]
+    fn test_extract_wheel_atomic_refuses_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        let wheels_dir = tmp.path().join("wheels");
+        let site_packages = tmp.path().join("site-packages");
+        fs::create_dir_all(&wheels_dir).unwrap();
+        fs::create_dir_all(&site_packages).unwrap();
+
+        let wheel = create_test_wheel(&wheels_dir, "mypkg");
+        let stats = Arc::new(ExtractStats::default());
+
+        // First extraction succeeds
+        extract_wheel_atomic(&wheel, &site_packages, "mypkg", 1, false, &stats).unwrap();
+
+        // Second extraction should fail (paths already exist)
+        let result = extract_wheel_atomic(&wheel, &site_packages, "mypkg", 1, false, &stats);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("refusing to overwrite"));
+    }
+
+    #[test]
+    fn test_commit_staged() {
+        let tmp = TempDir::new().unwrap();
+        let staging = tmp.path().join(".installing-test-abc123");
+        let target = tmp.path().join("site-packages");
+        fs::create_dir_all(&staging).unwrap();
+        fs::create_dir_all(&target).unwrap();
+
+        // Create a file in staging
+        fs::create_dir_all(staging.join("testpkg")).unwrap();
+        fs::write(staging.join("testpkg/__init__.py"), b"# test").unwrap();
+
+        commit_staged(&staging, &target).unwrap();
+
+        // File should be in target
+        assert!(target.join("testpkg/__init__.py").exists());
+        // Staging should be removed
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn test_cleanup_stale_staging() {
+        let tmp = TempDir::new().unwrap();
+        let sp = tmp.path();
+
+        // Create some staging dirs and a real package dir
+        fs::create_dir_all(sp.join(".installing-torch-abc123")).unwrap();
+        fs::write(sp.join(".installing-torch-abc123/file.txt"), b"stale").unwrap();
+        fs::create_dir_all(sp.join(".installing-numpy-def456")).unwrap();
+        fs::create_dir_all(sp.join("requests")).unwrap(); // real package, should not be removed
+
+        cleanup_stale_staging(sp).unwrap();
+
+        assert!(!sp.join(".installing-torch-abc123").exists());
+        assert!(!sp.join(".installing-numpy-def456").exists());
+        assert!(sp.join("requests").exists()); // untouched
+    }
+
+    #[test]
+    fn test_cleanup_stale_staging_nonexistent_dir() {
+        // Should not error on nonexistent dir
+        cleanup_stale_staging(Path::new("/tmp/nonexistent-zs-test-12345")).unwrap();
+    }
+}
