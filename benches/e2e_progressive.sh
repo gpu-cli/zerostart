@@ -196,12 +196,12 @@ os.makedirs(SP)
 daemon = DaemonHandle()
 daemon.start(
     wheels=[
-        {"url": "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30f90c4cf3be2571/six-1.17.0-py2.py3-none-any.whl",
-         "distribution": "six", "size": 11475, "import_roots": ["six"]},
+        {"url": "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl",
+         "distribution": "six", "size": 11050, "import_roots": ["six"]},
         {"url": "https://files.pythonhosted.org/packages/76/c6/c88e154df9c4e1a2a66ccf0005a88dfb2650c1dffb6f5ce603dfbd452ce3/idna-3.10-py3-none-any.whl",
          "distribution": "idna", "size": 70442, "import_roots": ["idna"]},
-        {"url": "https://files.pythonhosted.org/packages/4e/e1/e40ed5e7dc57e2f3d1b3f57a1b2b69466b3c8e659c26f9d2e72e09a17bab/certifi-2026.1.31-py3-none-any.whl",
-         "distribution": "certifi", "size": 164329, "import_roots": ["certifi"]},
+        {"url": "https://files.pythonhosted.org/packages/38/fc/bce832fd4fd99766c04d1ee0eead6b0ec6486fb100ae5e74c1d91292b982/certifi-2025.1.31-py3-none-any.whl",
+         "distribution": "certifi", "size": 166393, "import_roots": ["certifi"]},
     ],
     site_packages=SP,
 )

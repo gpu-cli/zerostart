@@ -221,7 +221,7 @@ async fn run_engine(
     let elapsed = start.elapsed();
 
     let (files, bytes) = engine.extract_stats();
-    let (total, done, _, _, failed) = engine.stats().await;
+    let (total, done, _, _, failed) = engine.stats();
 
     eprintln!();
     eprintln!("--- fast-wheel summary ---");

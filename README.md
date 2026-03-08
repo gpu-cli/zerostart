@@ -149,6 +149,72 @@ gpu run "zerostart doctor"
 gpu run "zerostart run python serve.py"
 ```
 
+## Benchmarks
+
+Measured on an RTX 4090 pod, comparing `uv pip install` (current fastest Python installer) against `zs-fast-wheel warm` (zerostart's progressive wheel installer):
+
+### Package Install Speed
+
+| Workload | Packages | Size | uv pip install | zs-fast-wheel | Speedup |
+|----------|----------|------|---------------|---------------|---------|
+| Small (requests, six, etc.) | 6 wheels | 3 MB | 767ms | 775ms | 1.0x |
+| Medium (numpy, pandas, scikit-learn) | 19 wheels | 251 MB | 12.0s | 1.3s | **9.3x** |
+| ML (torch, transformers, triton + CUDA) | 56 wheels | 7 GB | 97.8s | 16.2s | **6.0x** |
+
+For small packages there's no difference — the bottleneck is resolution, not download. For real ML stacks (hundreds of MB to multiple GB), zs-fast-wheel is **6-9x faster** than uv because it streams and extracts in parallel instead of download-then-extract.
+
+### Progressive Loading
+
+zs-fast-wheel supports **progressive loading** — Python can start importing packages while the rest are still downloading. On the same RTX 4090 pod:
+
+| Package | Size | Time to first import |
+|---------|------|---------------------|
+| numpy | 16 MB | 0.2s |
+| safetensors | 0.5 MB | 5.2s (queued behind large wheels) |
+| torch | 873 MB | 1.3s (demand-prioritized) |
+
+With demand signaling, `import torch` completes in **1.3 seconds** even though the full 7GB ML stack takes 16s to install. Your code starts running before the install finishes.
+
+### How It Works
+
+1. **Parallel streaming** — downloads and extracts wheels simultaneously across 8 connections
+2. **Demand signaling** — when Python hits `import torch`, the daemon reprioritizes torch to the front of the queue
+3. **Streaming extraction** — large wheels (>50MB) use HTTP Range requests to extract while downloading
+4. **No temp files** — wheels extract directly to site-packages, no intermediate copies
+
+## Architecture: zs-fast-wheel
+
+The package install layer is a standalone Rust binary + PyO3 module called `zs-fast-wheel`. It can be used independently of the rest of zerostart.
+
+```
+┌─────────────────────────────────────────────────┐
+│  Python process                                 │
+│                                                 │
+│  import torch  ──► lazy import hook             │
+│                     │                           │
+│                     ├─ signal_demand("torch")   │
+│                     └─ wait_done("torch")       │
+│                          │                      │
+│  ┌───────────────────────┼────────────────────┐ │
+│  │  DaemonEngine (Rust, in-process via PyO3)  │ │
+│  │                       │                    │ │
+│  │  ┌─── download ───┐   │   ┌── extract ──┐ │ │
+│  │  │ wheel 1  ████░░ │──┼──►│ site-pkgs/  │ │ │
+│  │  │ wheel 2  ██████ │  │   │ ✓ done      │ │ │
+│  │  │ torch    ░░░░░░ │◄─┘   │ ...         │ │ │
+│  │  │  (reprioritized) │     └─────────────┘ │ │
+│  │  └─────────────────┘                      │ │
+│  └───────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────┘
+```
+
+Key design decisions:
+
+- **Pure `std::sync` for cross-runtime safety** — the DaemonEngine uses `Mutex` + `Condvar` (not tokio sync primitives) so `wait_done()` works correctly when the PyO3 caller and the download tokio runtime are on separate threads. This was a critical bug fix — `tokio::sync::watch` channels silently hang when polled from a different runtime.
+- **In-process via PyO3** — no subprocess, no IPC, no sockets. The Rust engine runs as a native Python extension. `signal_demand()` and `wait_done()` are direct function calls with ~0 overhead.
+- **Atomic extraction** — each wheel extracts to a staging directory, then atomically renames into site-packages. Partial extractions never corrupt the target.
+- **Streaming for large wheels** — wheels >50MB use HTTP Range requests to start extracting before the full download completes.
+
 ## How It Compares
 
 | | Modal | zerostart |

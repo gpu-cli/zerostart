@@ -89,14 +89,14 @@ impl DaemonHandle {
     /// Signal that a distribution is needed urgently.
     fn signal_demand(&self, distribution: String) -> PyResult<()> {
         let engine = self.engine()?;
-        block_on(async { engine.signal_demand(&distribution).await });
+        engine.signal_demand(&distribution);
         Ok(())
     }
 
     /// Check if a distribution is done (non-blocking).
     fn is_done(&self, distribution: String) -> PyResult<bool> {
         let engine = self.engine()?;
-        Ok(block_on(async { engine.is_done(&distribution).await }))
+        Ok(engine.is_done(&distribution))
     }
 
     /// Wait for a specific distribution to complete.
@@ -111,17 +111,9 @@ impl DaemonHandle {
         let timeout = std::time::Duration::from_secs_f64(timeout_secs);
 
         py.detach(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
-
-            rt.block_on(async {
-                engine
-                    .wait_done(&distribution, timeout)
-                    .await
-                    .map_err(|e| PyTimeoutError::new_err(format!("{e}")))
-            })
+            engine
+                .wait_done(&distribution, timeout)
+                .map_err(|e| PyTimeoutError::new_err(format!("{e}")))
         })
     }
 
@@ -132,24 +124,16 @@ impl DaemonHandle {
         let timeout = std::time::Duration::from_secs_f64(timeout_secs);
 
         py.detach(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .map_err(|e| PyRuntimeError::new_err(format!("{e}")))?;
-
-            rt.block_on(async {
-                engine
-                    .wait_all(timeout)
-                    .await
-                    .map_err(|e| PyTimeoutError::new_err(format!("{e}")))
-            })
+            engine
+                .wait_all(timeout)
+                .map_err(|e| PyTimeoutError::new_err(format!("{e}")))
         })
     }
 
     /// Get stats: (total, done, pending, in_progress, failed)
     fn stats(&self) -> PyResult<(usize, usize, usize, usize, usize)> {
         let engine = self.engine()?;
-        Ok(block_on(async { engine.stats().await }))
+        Ok(engine.stats())
     }
 
     /// Shut down the daemon. Blocks until done.
@@ -170,14 +154,6 @@ impl DaemonHandle {
             .as_ref()
             .ok_or_else(|| PyRuntimeError::new_err("daemon not started"))
     }
-}
-
-/// Run a future on a one-shot current-thread runtime.
-fn block_on<F: std::future::Future<Output = T>, T>(f: F) -> T {
-    tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("current-thread runtime")
-        .block_on(f)
 }
 
 fn parse_wheel_spec(d: &Bound<'_, PyDict>) -> PyResult<WheelSpec> {

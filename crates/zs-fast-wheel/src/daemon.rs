@@ -1,17 +1,17 @@
 //! DaemonEngine: in-memory wheel installation engine.
 //!
 //! Core state is all in-memory — completion tracking, demand signaling,
-//! and stats use Arc+Mutex+watch channels. No file-based IPC.
+//! and stats use Arc+Mutex+Condvar. No file-based IPC, no tokio sync
+//! primitives (so it works across separate tokio runtimes).
 //!
 //! Used by both the CLI and PyO3 bindings.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{watch, Mutex, Notify};
 
 use crate::extract::{self, cleanup_stale_staging, ExtractStats};
 use crate::manifest::WheelSpec;
@@ -49,6 +49,13 @@ pub enum WheelStatus {
     Failed(String),
 }
 
+/// Shared completion state — pure std, no tokio dependency.
+struct CompletionState {
+    done: HashSet<String>,
+    failed: HashMap<String, String>,
+    all_finished: bool,
+}
+
 /// In-memory engine that downloads and extracts wheels progressively.
 ///
 /// All state is in-memory. Use `signal_demand()` to prioritize a package,
@@ -56,13 +63,8 @@ pub enum WheelStatus {
 /// until everything finishes.
 pub struct DaemonEngine {
     queue: Arc<Mutex<InstallQueue>>,
-    /// Per-distribution completion channels
-    completion_txs: Arc<Mutex<HashMap<String, watch::Sender<bool>>>>,
-    completion_rxs: Arc<Mutex<HashMap<String, watch::Receiver<bool>>>>,
-    /// Per-distribution failure messages
-    failures: Arc<Mutex<HashMap<String, String>>>,
-    /// Fires when all wheels are done (success or failure)
-    all_done: Arc<Notify>,
+    /// Completion tracking — protected by Mutex + Condvar for cross-runtime wake
+    completion: Arc<(Mutex<CompletionState>, Condvar)>,
     /// Extraction stats
     stats: Arc<ExtractStats>,
     /// Total wheel count
@@ -74,24 +76,19 @@ pub struct DaemonEngine {
 impl DaemonEngine {
     /// Create a new engine from wheel specs. Does NOT start downloading yet.
     pub fn new(wheels: Vec<WheelSpec>) -> Self {
-        let mut completion_txs = HashMap::new();
-        let mut completion_rxs = HashMap::new();
         let distributions: Vec<String> = wheels.iter().map(|w| w.distribution.clone()).collect();
-
-        for w in &wheels {
-            let (tx, rx) = watch::channel(false);
-            completion_txs.insert(w.distribution.clone(), tx);
-            completion_rxs.insert(w.distribution.clone(), rx);
-        }
-
         let total_wheels = wheels.len();
 
         Self {
             queue: Arc::new(Mutex::new(InstallQueue::new(wheels))),
-            completion_txs: Arc::new(Mutex::new(completion_txs)),
-            completion_rxs: Arc::new(Mutex::new(completion_rxs)),
-            failures: Arc::new(Mutex::new(HashMap::new())),
-            all_done: Arc::new(Notify::new()),
+            completion: Arc::new((
+                Mutex::new(CompletionState {
+                    done: HashSet::new(),
+                    failed: HashMap::new(),
+                    all_finished: total_wheels == 0,
+                }),
+                Condvar::new(),
+            )),
             stats: Arc::new(ExtractStats::default()),
             total_wheels,
             distributions,
@@ -108,7 +105,6 @@ impl DaemonEngine {
         cleanup_stale_staging(&config.site_packages)?;
 
         if self.total_wheels == 0 {
-            self.all_done.notify_waiters();
             return Ok(());
         }
 
@@ -118,10 +114,11 @@ impl DaemonEngine {
 
         let sem = Arc::new(tokio::sync::Semaphore::new(config.parallel_downloads));
         let mut handles = Vec::new();
+        let total_wheels = self.total_wheels;
 
         loop {
             let wheel = {
-                let mut q = self.queue.lock().await;
+                let mut q = self.queue.lock().unwrap();
                 q.next()
             };
 
@@ -135,10 +132,8 @@ impl DaemonEngine {
             let stats = self.stats.clone();
             let sem = sem.clone();
             let ext_threads = config.extract_threads;
-            let completion_txs = self.completion_txs.clone();
-            let failures = self.failures.clone();
+            let completion = self.completion.clone();
             let queue = self.queue.clone();
-            let all_done = self.all_done.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.context("semaphore closed")?;
@@ -171,34 +166,40 @@ impl DaemonEngine {
                     .await
                 };
 
+                let (lock, cvar) = &*completion;
+
                 match result {
                     Ok(()) => {
                         let elapsed = wheel_start.elapsed();
                         tracing::info!("[{dist}] done in {:.1}s", elapsed.as_secs_f64());
 
-                        // Signal completion
-                        let txs = completion_txs.lock().await;
-                        if let Some(tx) = txs.get(&dist) {
-                            let _ = tx.send(true);
+                        {
+                            let mut q = queue.lock().unwrap();
+                            q.mark_done(&dist);
                         }
 
-                        let mut q = queue.lock().await;
-                        q.mark_done(&dist);
-                        if q.is_empty() {
-                            all_done.notify_waiters();
+                        let mut state = lock.lock().unwrap();
+                        state.done.insert(dist);
+                        if state.done.len() + state.failed.len() >= total_wheels {
+                            state.all_finished = true;
                         }
+                        cvar.notify_all();
                     }
                     Err(e) => {
                         let err_msg = format!("{e:#}");
                         tracing::error!("[{dist}] failed: {err_msg}");
 
-                        failures.lock().await.insert(dist.clone(), err_msg);
-
-                        let mut q = queue.lock().await;
-                        q.mark_failed(&dist);
-                        if q.is_empty() {
-                            all_done.notify_waiters();
+                        {
+                            let mut q = queue.lock().unwrap();
+                            q.mark_failed(&dist);
                         }
+
+                        let mut state = lock.lock().unwrap();
+                        state.failed.insert(dist, err_msg);
+                        if state.done.len() + state.failed.len() >= total_wheels {
+                            state.all_finished = true;
+                        }
+                        cvar.notify_all();
                     }
                 }
 
@@ -214,8 +215,13 @@ impl DaemonEngine {
             }
         }
 
-        // Final notification
-        self.all_done.notify_waiters();
+        // Mark all finished
+        {
+            let (lock, cvar) = &*self.completion;
+            let mut state = lock.lock().unwrap();
+            state.all_finished = true;
+            cvar.notify_all();
+        }
 
         let elapsed = start.elapsed();
         let files = self.stats.files_written.load(Ordering::Relaxed);
@@ -233,31 +239,33 @@ impl DaemonEngine {
     }
 
     /// Bump a distribution to the front of the download queue.
-    pub async fn signal_demand(&self, distribution: &str) {
-        let mut q = self.queue.lock().await;
+    pub fn signal_demand(&self, distribution: &str) {
+        let mut q = self.queue.lock().unwrap();
         q.prioritize(distribution);
         tracing::info!("demand: prioritizing {distribution}");
     }
 
     /// Check if a distribution is done (non-blocking).
-    pub async fn is_done(&self, distribution: &str) -> bool {
-        let q = self.queue.lock().await;
-        q.is_done(distribution)
+    pub fn is_done(&self, distribution: &str) -> bool {
+        let (lock, _) = &*self.completion;
+        let state = lock.lock().unwrap();
+        state.done.contains(distribution)
     }
 
     /// Get the status of a distribution.
-    pub async fn status(&self, distribution: &str) -> WheelStatus {
-        let failures = self.failures.lock().await;
-        if let Some(err) = failures.get(distribution) {
+    pub fn status(&self, distribution: &str) -> WheelStatus {
+        let (lock, _) = &*self.completion;
+        let state = lock.lock().unwrap();
+        if let Some(err) = state.failed.get(distribution) {
             return WheelStatus::Failed(err.clone());
         }
-        drop(failures);
+        if state.done.contains(distribution) {
+            return WheelStatus::Done;
+        }
+        drop(state);
 
-        let q = self.queue.lock().await;
-        if q.is_done(distribution) {
-            WheelStatus::Done
-        } else if q.pending_count() > 0 || q.in_progress_count() > 0 {
-            // Rough — could be pending or in_progress
+        let q = self.queue.lock().unwrap();
+        if q.pending_count() > 0 || q.in_progress_count() > 0 {
             WheelStatus::InProgress
         } else {
             WheelStatus::Pending
@@ -266,61 +274,82 @@ impl DaemonEngine {
 
     /// Wait for a specific distribution to complete. Returns Ok(true) on success,
     /// Ok(false) if failed, Err on timeout.
-    pub async fn wait_done(&self, distribution: &str, timeout: Duration) -> Result<bool> {
-        // Already done?
-        {
-            let q = self.queue.lock().await;
-            if q.is_done(distribution) {
+    ///
+    /// Pure std::sync — works from any thread/runtime.
+    pub fn wait_done(&self, distribution: &str, timeout: Duration) -> Result<bool> {
+        let (lock, cvar) = &*self.completion;
+        let deadline = Instant::now() + timeout;
+
+        let mut state = lock.lock().unwrap();
+        loop {
+            if state.done.contains(distribution) {
                 return Ok(true);
             }
-        }
-
-        // Check failures
-        {
-            let failures = self.failures.lock().await;
-            if failures.contains_key(distribution) {
+            if state.failed.contains_key(distribution) {
                 return Ok(false);
             }
-        }
-
-        let mut rx = {
-            let rxs = self.completion_rxs.lock().await;
-            match rxs.get(distribution) {
-                Some(rx) => rx.clone(),
-                None => return Ok(true), // not in our set
+            if state.all_finished {
+                // All wheels done but this one isn't in done or failed — not in our set
+                return Ok(true);
             }
-        };
 
-        match tokio::time::timeout(timeout, rx.wait_for(|done| *done)).await {
-            Ok(Ok(_)) => Ok(true),
-            Ok(Err(_)) => Ok(false), // channel closed
-            Err(_) => anyhow::bail!("timed out waiting for {distribution}"),
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timed out waiting for {distribution}");
+            }
+
+            let (guard, timeout_result) = cvar.wait_timeout(state, remaining).unwrap();
+            state = guard;
+            if timeout_result.timed_out() {
+                // Check one more time
+                if state.done.contains(distribution) {
+                    return Ok(true);
+                }
+                if state.failed.contains_key(distribution) {
+                    return Ok(false);
+                }
+                anyhow::bail!("timed out waiting for {distribution}");
+            }
         }
     }
 
     /// Wait for all wheels to complete.
-    pub async fn wait_all(&self, timeout: Duration) -> Result<()> {
-        // Already done?
-        {
-            let q = self.queue.lock().await;
-            if q.is_empty() {
+    ///
+    /// Pure std::sync — works from any thread/runtime.
+    pub fn wait_all(&self, timeout: Duration) -> Result<()> {
+        let (lock, cvar) = &*self.completion;
+        let deadline = Instant::now() + timeout;
+
+        let mut state = lock.lock().unwrap();
+        loop {
+            if state.all_finished {
                 return Ok(());
             }
-        }
 
-        match tokio::time::timeout(timeout, self.all_done.notified()).await {
-            Ok(()) => Ok(()),
-            Err(_) => anyhow::bail!("timed out waiting for all wheels"),
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timed out waiting for all wheels");
+            }
+
+            let (guard, timeout_result) = cvar.wait_timeout(state, remaining).unwrap();
+            state = guard;
+            if timeout_result.timed_out() && !state.all_finished {
+                anyhow::bail!("timed out waiting for all wheels");
+            }
         }
     }
 
     /// Get summary stats: (total, done, pending, in_progress, failed)
-    pub async fn stats(&self) -> (usize, usize, usize, usize, usize) {
-        let q = self.queue.lock().await;
+    pub fn stats(&self) -> (usize, usize, usize, usize, usize) {
+        let (lock, _) = &*self.completion;
+        let state = lock.lock().unwrap();
+        let done = state.done.len();
+        let failed = state.failed.len();
+        let pending_plus_in_progress = self.total_wheels.saturating_sub(done + failed);
+        // Approximate split — queue tracks the precise counts
+        let q = self.queue.lock().unwrap();
         let pending = q.pending_count();
-        let in_progress = q.in_progress_count();
-        let failed = self.failures.lock().await.len();
-        let done = self.total_wheels.saturating_sub(pending + in_progress + failed);
+        let in_progress = pending_plus_in_progress.saturating_sub(pending);
         (self.total_wheels, done, pending, in_progress, failed)
     }
 
@@ -339,11 +368,6 @@ impl DaemonEngine {
     /// Total wheel count.
     pub fn total_wheels(&self) -> usize {
         self.total_wheels
-    }
-
-    /// Get a clone of the all_done notifier.
-    pub fn all_done_notify(&self) -> Arc<Notify> {
-        self.all_done.clone()
     }
 }
 
@@ -412,18 +436,18 @@ mod tests {
         let engine = DaemonEngine::new(wheels);
 
         // Signal demand for torch — should move it to front
-        engine.signal_demand("torch").await;
+        engine.signal_demand("torch");
 
-        let mut q = engine.queue.lock().await;
+        let mut q = engine.queue.lock().unwrap();
         let first = q.next();
         assert_eq!(first.as_ref().map(|w| w.distribution.as_str()), Some("torch"));
     }
 
-    #[tokio::test]
-    async fn test_stats_initial() {
+    #[test]
+    fn test_stats_initial() {
         let wheels = vec![make_wheel("six", 12_000)];
         let engine = DaemonEngine::new(wheels);
-        let (total, done, pending, in_progress, failed) = engine.stats().await;
+        let (total, done, pending, in_progress, failed) = engine.stats();
         assert_eq!(total, 1);
         assert_eq!(done, 0);
         assert_eq!(pending, 1);
@@ -443,5 +467,13 @@ mod tests {
         // Should complete immediately
         engine.run(&config).await.unwrap();
         let _ = std::fs::remove_dir_all("/tmp/zs-test-empty-engine");
+    }
+
+    #[test]
+    fn test_wait_done_not_in_set() {
+        let engine = DaemonEngine::new(vec![]);
+        // Distribution not in our set — should return Ok(true) immediately
+        let result = engine.wait_done("nonexistent", Duration::from_secs(1)).unwrap();
+        assert!(result);
     }
 }
