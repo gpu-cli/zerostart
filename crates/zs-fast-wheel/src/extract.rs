@@ -319,12 +319,26 @@ pub fn extract_wheel_atomic(
 }
 
 /// Move all top-level entries from staging dir into site-packages, then remove staging.
+///
+/// If a directory already exists in site-packages, merges contents recursively.
+/// If a file already exists, overwrites it (later wheel wins — matches pip behavior).
 pub fn commit_staged(staging: &Path, site_packages: &Path) -> Result<()> {
     for entry in fs::read_dir(staging)? {
         let entry = entry?;
         let dest = site_packages.join(entry.file_name());
         if dest.exists() {
-            anyhow::bail!("refusing to overwrite existing path: {}", dest.display());
+            if entry.file_type()?.is_dir() && dest.is_dir() {
+                // Merge directories recursively
+                merge_dir(&entry.path(), &dest)?;
+                fs::remove_dir_all(&entry.path())?;
+                continue;
+            }
+            // File exists — overwrite (later wheel wins)
+            if dest.is_file() {
+                fs::remove_file(&dest)?;
+            } else if dest.is_dir() {
+                fs::remove_dir_all(&dest)?;
+            }
         }
         fs::rename(entry.path(), &dest).with_context(|| {
             format!(
@@ -335,6 +349,29 @@ pub fn commit_staged(staging: &Path, site_packages: &Path) -> Result<()> {
         })?;
     }
     fs::remove_dir(staging)?;
+    Ok(())
+}
+
+/// Recursively merge src directory contents into dst directory.
+fn merge_dir(src: &Path, dst: &Path) -> Result<()> {
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            if target.is_dir() {
+                merge_dir(&entry.path(), &target)?;
+                fs::remove_dir_all(&entry.path())?;
+            } else {
+                fs::rename(entry.path(), &target)?;
+            }
+        } else {
+            // Move file, overwriting if exists
+            if target.exists() {
+                fs::remove_file(&target)?;
+            }
+            fs::rename(entry.path(), &target)?;
+        }
+    }
     Ok(())
 }
 
@@ -414,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_wheel_atomic_refuses_overwrite() {
+    fn test_extract_wheel_atomic_merges_on_overlap() {
         let tmp = TempDir::new().unwrap();
         let wheels_dir = tmp.path().join("wheels");
         let site_packages = tmp.path().join("site-packages");
@@ -427,13 +464,11 @@ mod tests {
         // First extraction succeeds
         extract_wheel_atomic(&wheel, &site_packages, "mypkg", 1, false, &stats).unwrap();
 
-        // Second extraction should fail (paths already exist)
-        let result = extract_wheel_atomic(&wheel, &site_packages, "mypkg", 1, false, &stats);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("refusing to overwrite"));
+        // Second extraction should also succeed (merges/overwrites)
+        extract_wheel_atomic(&wheel, &site_packages, "mypkg", 1, false, &stats).unwrap();
+
+        // Files should still be present
+        assert!(site_packages.join("mypkg/__init__.py").exists());
     }
 
     #[test]
