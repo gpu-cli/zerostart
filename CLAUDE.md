@@ -2,9 +2,9 @@
 
 ## What is zerostart
 
-Open-source Rust binary that eliminates GPU cold starts for Python applications. Combines CRIU process snapshots, NVIDIA cuda-checkpoint GPU snapshots, fast package installation (uv), and volume caching into a tiered cache hierarchy.
+Open-source Rust binary + Python SDK that eliminates GPU cold starts for Python applications. Fast parallel package installation (uv + streaming wheel extraction) and progressive imports let your app start using packages while they're still installing.
 
-Drop-in wrapper — `zerostart run python serve.py` — that makes second runs instant (~2s cold start).
+Drop-in wrapper — `zerostart run python serve.py` — that makes cold starts fast (~10-30s vs minutes).
 
 Repository: `github.com/gpu-cli/zerostart` (Apache 2.0)
 
@@ -19,6 +19,12 @@ cd crates && cargo clippy --workspace -- -D warnings
 cd crates && cargo fmt --workspace
 ```
 
+Cross-compile for Linux (musl static binary):
+```bash
+cd crates && cargo zigbuild --target x86_64-unknown-linux-musl --release -p zs-fast-wheel
+cp crates/target/x86_64-unknown-linux-musl/release/zs-fast-wheel bin/zs-fast-wheel-linux-x86_64
+```
+
 Python SDK:
 ```bash
 cd python && pip install -e .
@@ -26,75 +32,69 @@ cd python && pip install -e .
 
 ## Architecture
 
-Tiered cache hierarchy (like CPU L1/L2/L3). Miss one tier, fall through to the next:
+Fast package installation + progressive loading for container GPU environments:
 
-| Tier | Strategy | Cold start |
-|------|----------|------------|
-| 0 | GPU snapshot restore (CRIU + cuda-checkpoint) | ~2s |
-| 1 | Process snapshot restore (CRIU, no VRAM) | ~5s |
-| 2 | Volume-cached packages | ~10s |
-| 3 | Fast parallel install (uv) | ~30s |
+| Strategy | Cold start | How |
+|----------|------------|-----|
+| Volume-cached packages | ~10s | Reuse prior install from persistent volume |
+| Fast parallel install | ~30s | Streaming wheel extraction + demand-driven scheduling |
+| Progressive loading | overlap | App imports resolve as packages land (lazy import hook) |
 
-Every run that misses a tier builds it for next time. First run is Tier 3 (~30s), second run is Tier 0 (~2s).
+First run installs everything (~30s). Subsequent runs reuse the cached environment (~10s). Progressive loading means your app can start executing while large wheels (torch, transformers) are still extracting.
+
+## Key Decision: No CRIU
+
+CRIU process snapshots (Tier 0/1 in the original design) are **deferred indefinitely**. Reason: container GPU providers (RunPod, Vast.ai) don't grant `CAP_SYS_ADMIN` needed for CRIU. VM providers that support CRIU take 3-5min to boot, negating the ~2s restore benefit. The plans remain in `../private-zerostart/planning/criu-process-snapshots/` for future reference if container providers add privileged mode.
+
+Focus is on making Tier 2/3 (fast install + progressive loading) as fast as possible on container providers.
 
 ## Core API
 
 ### CLI
 
 ```bash
-# Auto-detect mode (default) — works with any server framework
-zerostart run vllm serve meta-llama/Llama-3-8B
+# Run with progressive package loading
+zerostart run python serve.py
 
-# Explicit health check
-zerostart run --ready=url:http://localhost:8000/health python serve.py
+# With explicit requirements
+zerostart run -r requirements.txt python serve.py
 
-# Signal mode (app touches /tmp/zerostart/ready)
-zerostart run --ready=signal python train.py
+# Direct wheel installation
+zs-fast-wheel install --wheels <urls> --target <dir>
 
-# Snapshot management
-zerostart list                    # show cached snapshots
-zerostart gc                     # garbage collect old snapshots
-zerostart doctor                 # check CRIU, cuda-checkpoint, drivers
+# Daemon mode (background install, demand-driven)
+zs-fast-wheel daemon --manifest manifest.json
+
+# Resolve + warm cache
+zs-fast-wheel warm --requirements "torch>=2.0\ntransformers"
 ```
 
-### Ready Detection (--ready flag)
-
-```
-auto      (default) Watch port binding + health probes + GPU memory stabilization
-signal    Wait for file touch at /tmp/zerostart/ready
-url:<url> Poll URL until 200
-file:<p>  Watch for file creation
-```
-
-### Python SDK (optional)
+### Python SDK
 
 ```python
-import zerostart
-zerostart.ready()                 # signal snapshot point (no-op if not under orchestrator)
+from zerostart.lazy_imports import install_hook, remove_hook
 
-@zerostart.on_restore             # run after restore (reinit RNG, reconnect DB, etc.)
-def reinit(): ...
+# Install hook — imports block until the package is extracted
+hook = install_hook(daemon=daemon_handle, import_map={"torch": "torch"})
 
-@zerostart.on_snapshot            # run before snapshot (close connections, flush logs)
-def cleanup(): ...
+# Your code runs immediately, imports resolve progressively
+import torch  # blocks only until torch wheel is extracted
+model = torch.load(...)
+
+report = remove_hook()  # returns per-package wait times
 ```
 
 ## Workspace Crates
 
 | Crate | Purpose |
 |-------|---------|
-| `zerostart` | CLI binary — `zerostart run`, `zerostart list`, `zerostart doctor` |
-| `zs-snapshot` | CRIU dump/restore orchestration + cuda-checkpoint integration |
-| `zs-cache` | Volume cache management, package installation (uv integration) |
-| `zs-detect` | Auto-detection of ready state (port binding, health check, GPU stabilization) |
+| `zs-fast-wheel` | CLI + library: parallel wheel download, streaming extraction, daemon mode, PyO3 bindings |
 
 ## Key Constraints
 
 - **Python + GPU focused** — Go/Rust/Node cold starts are 30-60ms, not worth solving
-- **Single-GPU only** — cuda-checkpoint does NOT support NCCL (multi-GPU)
-- **Same GPU type required** for snapshot restore
-- **Driver r550+** required for cuda-checkpoint
-- **Linux only** — CRIU is Linux-only (graceful degradation on macOS: just runs the app)
+- **Container-first** — designed for RunPod, Vast.ai, and similar container GPU providers
+- **Linux target** — cross-compile from macOS, test on Linux via `gpu run`
 
 ## Coding Conventions
 
@@ -115,16 +115,13 @@ def cleanup(): ...
 
 ## GPU Testing
 
-This project requires NVIDIA GPUs for snapshot testing. **Cross-compile locally, test on real GPUs via `gpu run`** — do NOT attempt CRIU/cuda-checkpoint tests locally on macOS.
+Cross-compile locally, test on container GPUs via `gpu run`. Binaries in `bin/` are gitignored and synced to pods via `gpu.jsonc` `include: ["bin/"]`.
 
 ```bash
 # Cross-compile locally (don't burn GPU time on compilation)
-cargo build --target x86_64-unknown-linux-gnu --release
+cd crates && cargo zigbuild --target x86_64-unknown-linux-musl --release -p zs-fast-wheel
+cp crates/target/x86_64-unknown-linux-musl/release/zs-fast-wheel bin/zs-fast-wheel-linux-x86_64
 
-# Test on a real GPU
-gpu run "zerostart doctor"
-gpu run "zerostart run python serve.py"
-gpu run "zerostart run vllm serve meta-llama/Llama-3-8B"
+# Test on a GPU pod
+gpu run "bin/zs-fast-wheel-linux-x86_64 warm --requirements 'torch>=2.0'"
 ```
-
-Any feature touching snapshots, CRIU, cuda-checkpoint, or GPU detection must be validated via `gpu run` before merging.
