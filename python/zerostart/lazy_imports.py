@@ -1,31 +1,21 @@
-"""Lazy import hook with demand signaling and progressive loading.
+"""Lazy import hook with in-memory demand signaling via DaemonHandle.
 
 The app starts immediately. When it hits `import torch`, the hook:
 1. Checks if torch is importable right now → yes? normal import.
-2. No? Writes "torch" to a demand file so the installer can prioritize it.
-3. Blocks, polling until torch appears on sys.path.
-4. As torch's __init__.py imports its own submodules (torch._C, torch.nn),
-   each resolves progressively as files land on disk.
+2. No? Calls daemon.signal_demand("torch") so the daemon prioritizes it.
+3. Calls daemon.wait_done("torch") — blocks until it's extracted.
+4. Retries the import.
 
-Bidirectional protocol with the background installer:
-
-    Hook → Installer (demand signal):
-        Appends import names to <status_dir>/demand (one per line).
-        Installer watches this file and bumps requested packages to
-        the front of the install queue.
-
-    Installer → Hook (progress):
-        <status_dir>/installing     — exists while installer is running
-        <status_dir>/__done__       — created when installer finishes
-
-    No per-package markers needed. The hook just retries find_spec()
-    against the real filesystem. When a wheel is extracted, its modules
-    become findable automatically.
+No file-based IPC — the DaemonHandle is an in-memory Rust object.
 
 Usage:
+    from zs_fast_wheel import DaemonHandle
     from zerostart.lazy_imports import install_hook, remove_hook
 
-    hook = install_hook(status_dir="/tmp/zs-status")
+    daemon = DaemonHandle()
+    daemon.start(wheels=[...], site_packages="...")
+
+    hook = install_hook(daemon=daemon)
 
     import torch        # blocks ~3s, signals demand for "torch"
     import torch.nn     # instant — torch is already on disk
@@ -41,17 +31,14 @@ import importlib
 import importlib.abc
 import importlib.util
 import logging
-import os
 import sys
-import threading
 import time
-from pathlib import Path
 
 log = logging.getLogger("zerostart")
 
 
 class LazyImportHook(importlib.abc.MetaPathFinder):
-    """Blocks imports until packages appear on disk. Signals demand to installer.
+    """Blocks imports until packages appear on disk. Signals demand to daemon.
 
     Never returns a loader — just gates the import, then lets normal
     machinery do the actual loading once files are on disk.
@@ -59,62 +46,31 @@ class LazyImportHook(importlib.abc.MetaPathFinder):
 
     def __init__(
         self,
-        status_dir: str | Path,
+        daemon: object,
+        import_map: dict[str, str] | None = None,
         timeout: float = 300.0,
         speculative_timeout: float = 5.0,
-        poll_interval: float = 0.05,
-        expected_packages: set[str] | None = None,
     ) -> None:
-        self.status_dir = Path(status_dir)
+        """
+        Args:
+            daemon: DaemonHandle instance (from zs_fast_wheel PyO3 module).
+            import_map: Maps import names → distribution names
+                        (e.g. {"yaml": "PyYAML", "PIL": "Pillow"}).
+                        If None, assumes import name == distribution name.
+            timeout: Max seconds to wait for known packages.
+            speculative_timeout: Max seconds for unknown packages (try/except imports).
+        """
+        self._daemon = daemon
+        self._import_map = import_map or {}
         self.timeout = timeout
         self.speculative_timeout = speculative_timeout
-        self.poll_interval = poll_interval
-        # If provided, only wait full timeout for these top-level names.
-        # Others get the shorter speculative_timeout (for try/except imports).
-        self._expected: set[str] | None = (
-            {p.lower().replace("-", "_") for p in expected_packages}
-            if expected_packages else None
-        )
 
-        # Track resolved modules — only cache at fullname level while
-        # installer is running (submodules may arrive later). Once installer
-        # is done, we cache at top-level to avoid repeated checks.
         self._resolved: set[str] = set()
-        self._waiting: set[str] = set()  # currently blocked, for logging
         self._wait_times: dict[str, float] = {}
-        self._demand_lock = threading.Lock()
-        self._demand_path = self.status_dir / "demand"
 
-    # ------------------------------------------------------------------
-    # Demand signaling — tell the installer what we need NOW
-    # ------------------------------------------------------------------
-
-    def _signal_demand(self, module_name: str) -> None:
-        """Append a module name to the demand file.
-
-        The installer watches this file and reprioritizes accordingly.
-        Thread-safe — multiple imports can signal concurrently.
-        """
-        with self._demand_lock:
-            try:
-                self.status_dir.mkdir(parents=True, exist_ok=True)
-                with open(self._demand_path, "a") as f:
-                    f.write(module_name + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-            except OSError:
-                pass  # best effort — installer may not be watching
-
-    # ------------------------------------------------------------------
-    # Installer state
-    # ------------------------------------------------------------------
-
-    def _installer_running(self) -> bool:
-        return (self.status_dir / "installing").exists()
-
-    # ------------------------------------------------------------------
-    # Import probing — can Python find this module right now?
-    # ------------------------------------------------------------------
+    def _dist_for_import(self, top_level: str) -> str:
+        """Map an import name to a distribution name."""
+        return self._import_map.get(top_level, top_level)
 
     def _can_import(self, fullname: str) -> bool:
         """Ask Python's import machinery if this module exists, bypassing ourselves."""
@@ -131,95 +87,69 @@ class LazyImportHook(importlib.abc.MetaPathFinder):
         finally:
             sys.meta_path.insert(idx, self)
 
-    # ------------------------------------------------------------------
-    # The main hook — called on every import statement
-    # ------------------------------------------------------------------
-
-    def _mark_resolved(self, fullname: str) -> None:
-        """Mark a module as resolved.
-
-        While installer is running, only cache exact fullname (submodules
-        may still be landing). Once installer is done, mark the top-level
-        package as fully resolved to skip all future checks.
-        """
-        self._resolved.add(fullname)
-        if not self._installer_running():
-            self._resolved.add(fullname.split(".")[0] + ".*")
-
     def find_spec(
         self,
         fullname: str,
         path: object = None,
         target: object = None,
     ) -> None:
-        # Fast path: already resolved this exact module, or entire package
-        # is resolved (installer done, marked with "pkg.*" sentinel)
         top = fullname.split(".")[0]
+
+        # Fast path: already resolved
         if fullname in self._resolved or top + ".*" in self._resolved:
             return None
 
-        # Already importable? Done.
+        # Already importable
         if self._can_import(fullname):
-            self._mark_resolved(fullname)
+            self._resolved.add(fullname)
             return None
 
-        # Not importable. Is the installer even running?
-        if not self._installer_running():
-            self._mark_resolved(fullname)
-            return None  # genuine ImportError
+        # Check if daemon knows about this distribution
+        dist = self._dist_for_import(top)
+        try:
+            done = self._daemon.is_done(dist)
+        except Exception:
+            # Daemon not started or errored — pass through
+            self._resolved.add(fullname)
+            return None
 
-        # --- Installer is running, module not yet available ---
-        # Signal demand so installer can prioritize this package
-        self._signal_demand(top)
+        if done:
+            # Daemon says done but Python can't find it — genuinely missing
+            self._resolved.add(top + ".*")
+            return None
 
-        # Use short timeout for speculative imports (try/except in libraries)
-        # unless this is a package we know is being installed.
-        is_expected = (
-            self._expected is None  # no list = wait for everything
-            or top.lower().replace("-", "_") in self._expected
-        )
-        max_wait = self.timeout if is_expected else self.speculative_timeout
+        # Signal demand and wait
+        self._daemon.signal_demand(dist)
 
-        log.info("import %s — waiting for install... (max %.0fs)",
-                 fullname, max_wait)
-        self._waiting.add(fullname)
+        # Use short timeout for speculative imports
+        is_known = dist.lower().replace("-", "_") in {
+            d.lower().replace("-", "_") for d in self._import_map.values()
+        } or top.lower() in {k.lower() for k in self._import_map}
+
+        max_wait = self.timeout if is_known or not self._import_map else self.speculative_timeout
+
+        log.info("import %s — waiting for %s... (max %.0fs)", fullname, dist, max_wait)
         start = time.monotonic()
 
-        while True:
-            importlib.invalidate_caches()
-
-            if self._can_import(fullname):
-                wait = time.monotonic() - start
-                # Record wait against top-level package, keep longest
-                if top not in self._wait_times or wait > self._wait_times[top]:
-                    self._wait_times[top] = wait
-                self._waiting.discard(fullname)
-                self._mark_resolved(fullname)
-                log.info("import %s — ready (%.1fs)", fullname, wait)
-                return None
-
-            if not self._installer_running():
-                wait = time.monotonic() - start
-                self._waiting.discard(fullname)
-                self._mark_resolved(fullname)
-                log.warning(
-                    "import %s — installer finished, module not found (%.1fs)",
-                    fullname,
-                    wait,
-                )
-                return None
-
+        try:
+            self._daemon.wait_done(dist, timeout_secs=max_wait)
+        except Exception as e:
             elapsed = time.monotonic() - start
-            if elapsed > max_wait:
-                self._waiting.discard(fullname)
-                self._mark_resolved(fullname)
-                if is_expected:
-                    log.error("import %s — timed out (%.0fs)", fullname, elapsed)
-                else:
-                    log.debug("import %s — speculative timeout (%.1fs)", fullname, elapsed)
-                return None
+            log.warning("import %s — wait failed after %.1fs: %s", fullname, elapsed, e)
+            self._resolved.add(fullname)
+            return None
 
-            time.sleep(self.poll_interval)
+        # Invalidate caches so Python sees the new files
+        importlib.invalidate_caches()
+
+        elapsed = time.monotonic() - start
+        if elapsed > 0.01:
+            if top not in self._wait_times or elapsed > self._wait_times[top]:
+                self._wait_times[top] = elapsed
+            log.info("import %s — ready (%.1fs)", fullname, elapsed)
+
+        self._resolved.add(fullname)
+        return None
 
     def report(self) -> dict[str, float]:
         """Return {package: seconds_waited} for imports that blocked."""
@@ -234,33 +164,28 @@ _active_hook: LazyImportHook | None = None
 
 
 def install_hook(
-    status_dir: str | Path,
+    daemon: object,
+    import_map: dict[str, str] | None = None,
     timeout: float = 300.0,
     speculative_timeout: float = 5.0,
-    poll_interval: float = 0.05,
-    expected_packages: set[str] | None = None,
 ) -> LazyImportHook:
-    """Install the lazy import hook into sys.meta_path.
+    """Install the lazy import hook.
 
     Args:
-        status_dir: Directory with 'installing' sentinel file.
-        timeout: Max seconds to wait for expected packages.
-        speculative_timeout: Max seconds to wait for unknown packages
-            (e.g. try/except imports in libraries). Default 5s.
-        poll_interval: Seconds between import retry checks.
-        expected_packages: Set of package names we know are being installed.
-            If None, wait full timeout for everything.
+        daemon: DaemonHandle instance.
+        import_map: Import name → distribution name mapping.
+        timeout: Max seconds to wait for known packages.
+        speculative_timeout: Max seconds for speculative imports.
     """
     global _active_hook  # noqa: PLW0603
     if _active_hook is not None:
         remove_hook()
 
     hook = LazyImportHook(
-        status_dir=status_dir,
+        daemon=daemon,
+        import_map=import_map,
         timeout=timeout,
         speculative_timeout=speculative_timeout,
-        poll_interval=poll_interval,
-        expected_packages=expected_packages,
     )
     sys.meta_path.insert(0, hook)
     _active_hook = hook
