@@ -16,7 +16,7 @@ echo "=== zerostart GPU Test Runner ==="
 echo "Date: $(date)"
 echo "Python: $(python3 --version)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
-echo "Disk: $(df -h /tmp | tail -1 | awk '{print $4 " free"}')"
+echo "Disk: $(df -h /tmp | tail -1 | awk '{print $4 " free"}') (container), $(df -h /gpu-cli-workspaces | tail -1 | awk '{print $4 " free"}') (volume)"
 echo ""
 
 # --- Setup ---
@@ -31,11 +31,15 @@ done
 cd /workspace/zerostart 2>/dev/null || cd "$(dirname "$0")/.."
 echo "project root: $(pwd)"
 
-# Create a fresh venv (the synced .venv has macOS python which breaks maturin)
+# Use the persistent volume for everything heavy (container disk is only 20GB)
+VOLDIR=/gpu-cli-workspaces/.cache/zerostart-test
+mkdir -p "$VOLDIR"
+
+# Create a fresh venv on the volume (the synced .venv has macOS python which breaks maturin)
 echo "Creating fresh venv..."
-rm -rf /tmp/zs-venv
-python3 -m venv /tmp/zs-venv
-source /tmp/zs-venv/bin/activate
+rm -rf "$VOLDIR/venv"
+python3 -m venv "$VOLDIR/venv"
+source "$VOLDIR/venv/bin/activate"
 pip install maturin 2>&1 | tail -1
 
 # Build PyO3 module first (zs-fast-wheel must exist before zerostart can import it)
@@ -53,8 +57,8 @@ echo "zerostart installed: $(which zerostart)"
 # Verify imports
 python3 -c "import zerostart; import zs_fast_wheel; print('imports ok')"
 
-# Shared cache dir — reuse across tests to save disk
-CACHE=/tmp/zs_cache
+# Shared cache dir on the volume — reuse across tests to save disk
+CACHE="$VOLDIR/cache"
 rm -rf "$CACHE"
 
 # Cleanup helper
@@ -309,8 +313,8 @@ assert requests.__version__ == "2.31.0", f"expected requests 2.31.0, got {reques
 print(f"numpy={np.__version__} requests={requests.__version__} — versions correct")
 PYEOF
 echo -e 'numpy==1.26.4\nrequests==2.31.0' > /tmp/reqs_pinned.txt
-rm -rf /tmp/zs_t_pinned
-if zerostart -r /tmp/reqs_pinned.txt --cache-dir /tmp/zs_t_pinned /tmp/test_pinned.py 2>&1; then
+rm -rf $VOLDIR/t_pinned
+if zerostart -r /tmp/reqs_pinned.txt --cache-dir $VOLDIR/t_pinned /tmp/test_pinned.py 2>&1; then
     pass "3.1 pinned versions"
 else
     fail "3.1 pinned versions" "exit $?"
@@ -319,7 +323,7 @@ fi
 # --- 3.2 Version upgrade — cache invalidation ---
 echo ""
 echo "--- 3.2 Version upgrade cache invalidation ---"
-rm -rf /tmp/zs_t_upgrade
+rm -rf $VOLDIR/t_upgrade
 
 # Run 1: numpy 1.26.4
 echo 'numpy==1.26.4' > /tmp/reqs_v1.txt
@@ -328,8 +332,8 @@ import numpy as np
 print(f"v1: numpy={np.__version__}")
 assert np.__version__ == "1.26.4"
 PYEOF
-zerostart -r /tmp/reqs_v1.txt --cache-dir /tmp/zs_t_upgrade /tmp/test_v1.py 2>&1
-ENVS_AFTER_V1=$(ls /tmp/zs_t_upgrade/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_v1.txt --cache-dir $VOLDIR/t_upgrade /tmp/test_v1.py 2>&1
+ENVS_AFTER_V1=$(ls $VOLDIR/t_upgrade/envs/ 2>/dev/null | wc -l)
 
 # Run 2: numpy 1.26.3 (different version)
 echo 'numpy==1.26.3' > /tmp/reqs_v2.txt
@@ -338,8 +342,8 @@ import numpy as np
 print(f"v2: numpy={np.__version__}")
 assert np.__version__ == "1.26.3"
 PYEOF
-zerostart -r /tmp/reqs_v2.txt --cache-dir /tmp/zs_t_upgrade /tmp/test_v2.py 2>&1
-ENVS_AFTER_V2=$(ls /tmp/zs_t_upgrade/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_v2.txt --cache-dir $VOLDIR/t_upgrade /tmp/test_v2.py 2>&1
+ENVS_AFTER_V2=$(ls $VOLDIR/t_upgrade/envs/ 2>/dev/null | wc -l)
 
 if [ "$ENVS_AFTER_V2" -gt "$ENVS_AFTER_V1" ]; then
     pass "3.2 version upgrade creates new cache"
@@ -350,20 +354,20 @@ fi
 # --- 3.3 Adding a package ---
 echo ""
 echo "--- 3.3 Adding a package to requirements ---"
-rm -rf /tmp/zs_t_add
+rm -rf $VOLDIR/t_add
 
 echo 'six' > /tmp/reqs_add1.txt
 echo 'import six; print(f"six={six.__version__}")' > /tmp/test_add.py
-zerostart -r /tmp/reqs_add1.txt --cache-dir /tmp/zs_t_add /tmp/test_add.py 2>&1
-ENVS_1=$(ls /tmp/zs_t_add/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_add1.txt --cache-dir $VOLDIR/t_add /tmp/test_add.py 2>&1
+ENVS_1=$(ls $VOLDIR/t_add/envs/ 2>/dev/null | wc -l)
 
 echo -e 'six\nidna' > /tmp/reqs_add2.txt
 cat > /tmp/test_add2.py << 'PYEOF'
 import six, idna
 print(f"six={six.__version__} idna={idna.__version__}")
 PYEOF
-zerostart -r /tmp/reqs_add2.txt --cache-dir /tmp/zs_t_add /tmp/test_add2.py 2>&1
-ENVS_2=$(ls /tmp/zs_t_add/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_add2.txt --cache-dir $VOLDIR/t_add /tmp/test_add2.py 2>&1
+ENVS_2=$(ls $VOLDIR/t_add/envs/ 2>/dev/null | wc -l)
 
 if [ "$ENVS_2" -gt "$ENVS_1" ]; then
     pass "3.3 adding package creates new cache"
@@ -374,19 +378,19 @@ fi
 # --- 3.4 Warm cache hit ---
 echo ""
 echo "--- 3.4 Warm cache hit ---"
-rm -rf /tmp/zs_t_warm
+rm -rf $VOLDIR/t_warm
 echo 'import six; print(f"six={six.__version__}")' > /tmp/test_warm.py
 echo 'six' > /tmp/reqs_warm.txt
 
 # Cold run
 T0=$(date +%s%N)
-zerostart -r /tmp/reqs_warm.txt --cache-dir /tmp/zs_t_warm /tmp/test_warm.py 2>&1
+zerostart -r /tmp/reqs_warm.txt --cache-dir $VOLDIR/t_warm /tmp/test_warm.py 2>&1
 T1=$(date +%s%N)
 COLD_MS=$(( (T1 - T0) / 1000000 ))
 
 # Warm run
 T0=$(date +%s%N)
-zerostart -r /tmp/reqs_warm.txt --cache-dir /tmp/zs_t_warm /tmp/test_warm.py 2>&1
+zerostart -r /tmp/reqs_warm.txt --cache-dir $VOLDIR/t_warm /tmp/test_warm.py 2>&1
 T1=$(date +%s%N)
 WARM_MS=$(( (T1 - T0) / 1000000 ))
 
@@ -398,7 +402,7 @@ else
 fi
 
 # Clean up version test caches to reclaim disk before heavy tests
-rm -rf /tmp/zs_t_pinned /tmp/zs_t_upgrade /tmp/zs_t_add /tmp/zs_t_warm
+rm -rf $VOLDIR/t_pinned $VOLDIR/t_upgrade $VOLDIR/t_add $VOLDIR/t_warm
 
 echo ""
 echo "=== 4. Progressive Loading ==="
@@ -626,9 +630,10 @@ echo "=== 7. Performance ==="
 # --- 7.1 Install speed: zs-fast-wheel warm vs uv ---
 echo ""
 echo "--- 7.1 Install speed comparison ---"
-SITE_PKG=$(mktemp -d)
+SITE_PKG="$VOLDIR/bench_site"
 
 echo "  uv pip install (medium workload):"
+rm -rf "$SITE_PKG" && mkdir -p "$SITE_PKG"
 T0=$(date +%s%N)
 uv pip install numpy pandas scikit-learn --target "$SITE_PKG" 2>&1 | tail -1
 T1=$(date +%s%N)
