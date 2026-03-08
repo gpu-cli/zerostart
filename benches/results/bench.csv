@@ -1,0 +1,7 @@
+label,method,time_ms,files,size_mb
+small,uv_install,1289,130,3
+small,zs_warm,619,116,3
+medium,uv_install,15502,5422,251
+medium,zs_warm,1266,5379,267
+ml,uv_install,123252,19697,7024
+ml,zs_warm,13230,19824,5751
