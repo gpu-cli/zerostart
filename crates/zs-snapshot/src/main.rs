@@ -40,6 +40,14 @@ enum Commands {
         /// Dump timeout in seconds
         #[arg(long, default_value = "120")]
         timeout_secs: u64,
+
+        /// Pass --tcp-established to CRIU (for services with open sockets)
+        #[arg(long, default_value = "false")]
+        tcp_established: bool,
+
+        /// Pass --ext-unix-sk to CRIU (for services with unix sockets)
+        #[arg(long, default_value = "false")]
+        ext_unix_sk: bool,
     },
 
     /// Restore a process from a snapshot
@@ -59,6 +67,14 @@ enum Commands {
         /// Restore timeout in seconds
         #[arg(long, default_value = "60")]
         timeout_secs: u64,
+
+        /// Pass --tcp-established to CRIU
+        #[arg(long, default_value = "false")]
+        tcp_established: bool,
+
+        /// Pass --ext-unix-sk to CRIU
+        #[arg(long, default_value = "false")]
+        ext_unix_sk: bool,
     },
 }
 
@@ -79,12 +95,16 @@ async fn main() -> Result<()> {
             metadata,
             cache_dir,
             timeout_secs,
+            tcp_established,
+            ext_unix_sk,
         } => {
             let cache_dir = expand_tilde(&cache_dir);
             let config = SnapshotConfig {
                 cache_dir,
                 dump_timeout: Duration::from_secs(timeout_secs),
                 restore_timeout: Duration::from_secs(60),
+                tcp_established,
+                ext_unix_sk,
             };
             let id = SnapshotId { intent_hash };
 
@@ -101,12 +121,16 @@ async fn main() -> Result<()> {
             pidfile,
             cache_dir,
             timeout_secs,
+            tcp_established,
+            ext_unix_sk,
         } => {
             let cache_dir = expand_tilde(&cache_dir);
             let config = SnapshotConfig {
                 cache_dir,
                 dump_timeout: Duration::from_secs(120),
                 restore_timeout: Duration::from_secs(timeout_secs),
+                tcp_established,
+                ext_unix_sk,
             };
             let id = SnapshotId { intent_hash };
 

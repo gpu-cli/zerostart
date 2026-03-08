@@ -9,6 +9,10 @@ pub struct SnapshotConfig {
     pub cache_dir: PathBuf,
     pub dump_timeout: Duration,
     pub restore_timeout: Duration,
+    /// Pass --tcp-established to CRIU (requires network namespace support).
+    pub tcp_established: bool,
+    /// Pass --ext-unix-sk to CRIU (requires network namespace support).
+    pub ext_unix_sk: bool,
 }
 
 /// Identifies a snapshot by its intent hash.

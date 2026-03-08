@@ -29,22 +29,27 @@ pub async fn restore_detached(
     let start = Instant::now();
 
     let result = timeout(config.restore_timeout, async {
-        Command::new("criu")
-            .arg("restore")
+        let mut cmd = Command::new("criu");
+        cmd.arg("restore")
             .arg("--images-dir")
             .arg(&images)
             .arg("--shell-job")
-            .arg("--tcp-established")
-            .arg("--ext-unix-sk")
             .arg("--file-locks")
             .arg("--restore-detached")
             .arg("--pidfile")
             .arg(pidfile)
             .arg("--log-file")
             .arg(snap_dir.join("restore.log"))
-            .arg("-v4")
-            .output()
-            .await
+            .arg("-v4");
+
+        if config.tcp_established {
+            cmd.arg("--tcp-established");
+        }
+        if config.ext_unix_sk {
+            cmd.arg("--ext-unix-sk");
+        }
+
+        cmd.output().await
     })
     .await;
 

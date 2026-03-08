@@ -25,22 +25,30 @@ pub async fn dump_leave_running(
     let start = Instant::now();
 
     let result = timeout(config.dump_timeout, async {
-        Command::new("criu")
-            .arg("dump")
+        let mut cmd = Command::new("criu");
+        cmd.arg("dump")
             .arg("--tree")
             .arg(pid.to_string())
             .arg("--images-dir")
             .arg(&images)
             .arg("--leave-running")
             .arg("--shell-job")
-            .arg("--tcp-established")
-            .arg("--ext-unix-sk")
             .arg("--file-locks")
             .arg("--log-file")
             .arg(snap_dir.join("dump.log"))
-            .arg("-v4")
-            .output()
-            .await
+            .arg("-v4");
+
+        // Network flags — only add when the process has sockets.
+        // These require network namespace support which may not be
+        // available in all container environments.
+        if config.tcp_established {
+            cmd.arg("--tcp-established");
+        }
+        if config.ext_unix_sk {
+            cmd.arg("--ext-unix-sk");
+        }
+
+        cmd.output().await
     })
     .await;
 
