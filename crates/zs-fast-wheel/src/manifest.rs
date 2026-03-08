@@ -25,8 +25,6 @@ pub struct WheelSpec {
 pub struct Manifest {
     /// Target site-packages directory
     pub site_packages: PathBuf,
-    /// Status directory for done/failed markers and demand file
-    pub status_dir: PathBuf,
     /// Wheels to install
     pub wheels: Vec<WheelSpec>,
 }
@@ -60,7 +58,7 @@ mod tests {
             &manifest_path,
             r#"{
                 "site_packages": "/tmp/sp",
-                "status_dir": "/tmp/status",
+
                 "wheels": [
                     {
                         "url": "https://files.pythonhosted.org/packages/.../torch-2.4.1.whl",
@@ -91,7 +89,6 @@ mod tests {
         assert_eq!(manifest.wheels[1].distribution, "requests");
         assert!(manifest.wheels[1].hash.is_none());
         assert_eq!(manifest.site_packages, PathBuf::from("/tmp/sp"));
-        assert_eq!(manifest.status_dir, PathBuf::from("/tmp/status"));
     }
 
     #[test]
@@ -102,7 +99,7 @@ mod tests {
             &manifest_path,
             r#"{
                 "site_packages": "/tmp/sp",
-                "status_dir": "/tmp/status",
+
                 "wheels": [
                     {
                         "url": "https://example.com/pkg-1.0.whl",
@@ -129,7 +126,7 @@ mod tests {
             &manifest_path,
             r#"{
                 "site_packages": "/tmp/sp",
-                "status_dir": "/tmp/status",
+
                 "wheels": []
             }"#,
         )
@@ -165,7 +162,7 @@ mod tests {
             &manifest_path,
             r#"{
                 "site_packages": "/tmp/sp",
-                "status_dir": "/tmp/status",
+
                 "wheels": [{"url": "https://example.com/pkg.whl"}]
             }"#,
         )

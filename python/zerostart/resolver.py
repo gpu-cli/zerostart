@@ -255,7 +255,7 @@ def _guess_import_roots(distribution: str, pypi_data: dict) -> list[str]:
 def generate_manifest(
     plan: ArtifactPlan,
     site_packages: Path,
-    status_dir: Path,
+    output_dir: Path,
 ) -> Path:
     """Write manifest.json for the fast-wheel daemon.
 
@@ -263,7 +263,6 @@ def generate_manifest(
     """
     manifest = {
         "site_packages": str(site_packages),
-        "status_dir": str(status_dir),
         "wheels": [
             {
                 "url": w.url,
@@ -276,6 +275,6 @@ def generate_manifest(
         ],
     }
 
-    path = status_dir / "manifest.json"
+    path = output_dir / "manifest.json"
     path.write_text(json.dumps(manifest, indent=2))
     return path

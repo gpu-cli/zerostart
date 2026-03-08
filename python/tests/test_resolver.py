@@ -87,17 +87,17 @@ def test_generate_manifest():
 
     with tempfile.TemporaryDirectory() as tmp:
         sp = Path(tmp) / "site-packages"
-        sd = Path(tmp) / "status"
+        out = Path(tmp) / "output"
         sp.mkdir()
-        sd.mkdir()
+        out.mkdir()
 
-        manifest_path = generate_manifest(plan, sp, sd)
+        manifest_path = generate_manifest(plan, sp, out)
 
         assert manifest_path.exists()
         data = json.loads(manifest_path.read_text())
 
         assert data["site_packages"] == str(sp)
-        assert data["status_dir"] == str(sd)
+        assert "status_dir" not in data
         # Only fast wheels in manifest (torch, not six)
         assert len(data["wheels"]) == 1
         assert data["wheels"][0]["distribution"] == "torch"
@@ -115,11 +115,11 @@ def test_generate_manifest_empty_fast_wheels():
 
     with tempfile.TemporaryDirectory() as tmp:
         sp = Path(tmp) / "site-packages"
-        sd = Path(tmp) / "status"
+        out = Path(tmp) / "output"
         sp.mkdir()
-        sd.mkdir()
+        out.mkdir()
 
-        manifest_path = generate_manifest(plan, sp, sd)
+        manifest_path = generate_manifest(plan, sp, out)
         data = json.loads(manifest_path.read_text())
         assert data["wheels"] == []
 
