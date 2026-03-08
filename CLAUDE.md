@@ -115,11 +115,16 @@ def cleanup(): ...
 
 ## GPU Testing
 
-This project requires NVIDIA GPUs for snapshot testing. Use gpu-cli:
+This project requires NVIDIA GPUs for snapshot testing. **Cross-compile locally, test on real GPUs via `gpu run`** — do NOT attempt CRIU/cuda-checkpoint tests locally on macOS.
 
 ```bash
+# Cross-compile locally (don't burn GPU time on compilation)
+cargo build --target x86_64-unknown-linux-gnu --release
+
+# Test on a real GPU
 gpu run "zerostart doctor"
 gpu run "zerostart run python serve.py"
+gpu run "zerostart run vllm serve meta-llama/Llama-3-8B"
 ```
 
-Do NOT attempt CRIU/cuda-checkpoint tests locally on macOS.
+Any feature touching snapshots, CRIU, cuda-checkpoint, or GPU detection must be validated via `gpu run` before merging.

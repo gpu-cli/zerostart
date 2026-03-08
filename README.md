@@ -136,6 +136,19 @@ gpu-cli automatically wraps your commands with zerostart. Your second `gpu run` 
 
 On macOS: zerostart gracefully degrades — runs your app normally without snapshots.
 
+## Testing on Real GPUs
+
+Build locally with cross-compilation to avoid burning GPU time on compilation, then use [gpu-cli](https://gpu-cli.sh) to test on real NVIDIA GPUs:
+
+```bash
+# Cross-compile locally for Linux
+cargo build --target x86_64-unknown-linux-gnu --release
+
+# Test on a real GPU (binary synced automatically)
+gpu run "zerostart doctor"
+gpu run "zerostart run python serve.py"
+```
+
 ## How It Compares
 
 | | Modal | zerostart |
