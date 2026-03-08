@@ -1,12 +1,6 @@
-mod daemon;
-mod demand;
-mod download;
-mod extract;
-pub mod manifest;
-mod pipeline;
-pub mod queue;
-pub mod status;
-mod streaming;
+use zs_fast_wheel::daemon::{DaemonConfig, DaemonEngine};
+use zs_fast_wheel::manifest::Manifest;
+use zs_fast_wheel::pipeline;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -116,6 +110,34 @@ async fn main() -> Result<()> {
             manifest,
             parallel_downloads,
             extract_threads,
-        } => daemon::run(manifest, parallel_downloads, extract_threads).await,
+        } => {
+            let manifest_data = Manifest::from_file(&manifest)?;
+
+            let config = DaemonConfig {
+                site_packages: manifest_data.site_packages.clone(),
+                parallel_downloads,
+                extract_threads,
+            };
+
+            let engine = DaemonEngine::new(manifest_data.wheels);
+
+            let start = std::time::Instant::now();
+            engine.run(&config).await?;
+            let elapsed = start.elapsed();
+
+            let (files, bytes) = engine.extract_stats();
+            let (total, done, _, _, failed) = engine.stats().await;
+
+            eprintln!();
+            eprintln!("--- fast-wheel daemon summary ---");
+            eprintln!("Wheels: {total} ({done} done, {failed} failed)");
+            eprintln!(
+                "Extracted: {files} files ({:.1} MB)",
+                bytes as f64 / 1024.0 / 1024.0
+            );
+            eprintln!("Total time: {:.1}s", elapsed.as_secs_f64());
+
+            Ok(())
+        }
     }
 }
