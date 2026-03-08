@@ -236,11 +236,18 @@ def run(
     # Start Rust daemon for large wheels
     daemon = _start_daemon(plan, site_packages)
 
-    # Install lazy import hook
+    # Install lazy import hook (only when daemon is running)
     hook = install_hook(
         daemon=daemon,
         import_map=plan.import_to_distribution,
     ) if daemon else None
+
+    # If no daemon (all small packages via uv), wait for uv to finish
+    # before running the script — there's no lazy hook to gate imports
+    if not daemon and uv_thread:
+        log.info("Waiting for uv to finish (no large wheels to stream)...")
+        uv_thread.join(timeout=120)
+        uv_thread = None  # Already joined, don't join again in finally
 
     # Run user script
     log.info("Running %s (packages installing in background)...", script)
