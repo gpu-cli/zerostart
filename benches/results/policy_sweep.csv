@@ -1,0 +1,10 @@
+test,config,time_ms,wheels,files,size_mb
+concurrency,j2,29186,56,19584,7023
+concurrency,j4,29610,56,19584,7023
+concurrency,j8,16163,56,19584,7023
+concurrency,j16,24077,56,19584,7023
+concurrency,j32,23158,56,19584,7023
+small_pkgs,daemon,1182,12,261,7
+small_pkgs,uv,1815,12,287,7
+full_stack,daemon_only,15573,0,19590,7023
+full_stack,hybrid,21527,0,19784,7029
