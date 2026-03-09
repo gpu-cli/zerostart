@@ -15,6 +15,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -273,10 +275,20 @@ def _lookup_pypi_wheel(
             # Skip free-threaded builds (cp314t) — we need regular cpython (cp314)
             if f"-{py_major_minor}t-" in filename:
                 continue
-            # Check Python compatibility: cpXXX or py3
+            # Check Python compatibility: cpXXX, py3, or abi3 (stable ABI)
             # Use delimiter-aware matching to avoid "cp311" matching "pypy311"
             if f"-{py_major_minor}-" in filename or "-py3-" in filename:
                 best_platform = entry
+            elif "-abi3-" in filename:
+                # abi3 wheels are compatible with any CPython >= the tagged version
+                # e.g. cp39-abi3 works with 3.9, 3.10, 3.11, ...
+                import re as _re
+                m = _re.search(r"-cp(\d)(\d+)-abi3-", filename)
+                if m:
+                    wheel_major, wheel_minor = int(m.group(1)), int(m.group(2))
+                    our_major, our_minor = (int(x) for x in python_version.split("."))
+                    if (our_major, our_minor) >= (wheel_major, wheel_minor):
+                        best_platform = entry
             # Don't promote wrong-Python wheels (e.g. PyPy) to best_platform
             continue
 

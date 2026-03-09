@@ -15,8 +15,7 @@
     "shell": {
       "steps": [
         { "run": "curl -LsSf https://astral.sh/uv/install.sh | sh" },
-        { "run": "chmod +x bin/*-linux-x86_64" },
-        { "run": "pip install pytest" }
+        { "run": "chmod +x bin/*-linux-x86_64" }
       ]
     }
   },

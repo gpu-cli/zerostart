@@ -84,6 +84,64 @@ def _find_site_packages(venv: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
+class DaemonProcess:
+    """Wrapper around a zs-fast-wheel subprocess that implements the daemon API.
+
+    The binary runs to completion — it downloads all wheels and extracts them
+    to site-packages, then exits. This wrapper provides the same API as the
+    PyO3 DaemonHandle so the lazy import hook works transparently.
+    """
+
+    def __init__(self, proc: subprocess.Popen, manifest_path: str):  # type: ignore[type-arg]
+        self._proc = proc
+        self._manifest_path = manifest_path
+        self._done = False
+
+    def is_done(self, distribution: str) -> bool:
+        if self._done:
+            return True
+        if self._proc.poll() is not None:
+            self._done = True
+            return True
+        return False
+
+    def signal_demand(self, distribution: str) -> None:
+        # Binary doesn't support demand signaling — it processes all wheels
+        pass
+
+    def wait_done(self, distribution: str, timeout_secs: float = 120.0) -> None:
+        if self._done:
+            return
+        try:
+            self._proc.wait(timeout=timeout_secs)
+        except subprocess.TimeoutExpired:
+            log.warning("daemon timed out after %.0fs waiting for %s", timeout_secs, distribution)
+        self._done = True
+
+    def wait_all(self, timeout_secs: float = 60.0) -> None:
+        if self._done:
+            return
+        try:
+            self._proc.wait(timeout=timeout_secs)
+        except subprocess.TimeoutExpired:
+            log.warning("daemon timed out after %.0fs", timeout_secs)
+            self._proc.kill()
+        self._done = True
+
+    def shutdown(self) -> None:
+        if self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        # Clean up manifest
+        try:
+            Path(self._manifest_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def parse_requirements(path: str) -> list[str]:
     """Parse a requirements.txt file, returning package specifiers."""
     reqs = []
@@ -197,43 +255,127 @@ def _uv_install_background(venv: Path, whl_paths: list[Path]) -> None:
 # Installation: uv for small wheels, daemon for large wheels
 # ---------------------------------------------------------------------------
 
-def _start_daemon(plan: ArtifactPlan, site_packages: Path, wheel_cache_dir: Path) -> tuple[object | None, list[Path]]:
-    """Start the Rust DaemonHandle for large wheels.
+def _find_daemon_binary() -> str | None:
+    """Find the zs-fast-wheel binary.
 
-    Returns (daemon_handle, list_of_saved_whl_paths).
-    The daemon saves .whl files to wheel_cache_dir so we can feed them to uv later.
+    Search order:
+    1. ZEROSTART_DAEMON env var
+    2. zs-fast-wheel on PATH
+    3. bin/zs-fast-wheel-linux-x86_64 (cross-compiled, relative to project root)
+    """
+    if env_bin := os.environ.get("ZEROSTART_DAEMON"):
+        if Path(env_bin).is_file():
+            return env_bin
+
+    if path_bin := shutil.which("zs-fast-wheel"):
+        return path_bin
+
+    # Check common locations for cross-compiled binary
+    import platform as _plat
+    arch = _plat.machine()
+    system = _plat.system().lower()
+    suffix = f"{system}-{arch}" if system != "darwin" else f"darwin-{arch}"
+    for candidate in [
+        Path(f"bin/zs-fast-wheel-{suffix}"),
+        Path(f"bin/zs-fast-wheel-linux-x86_64"),
+        Path(__file__).parent.parent.parent / f"bin/zs-fast-wheel-{suffix}",
+        Path(__file__).parent.parent.parent / "bin/zs-fast-wheel-linux-x86_64",
+    ]:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    return None
+
+
+def _start_daemon(plan: ArtifactPlan, site_packages: Path, wheel_cache_dir: Path) -> tuple[object | None, list[Path]]:
+    """Start the Rust daemon for large wheels.
+
+    Tries PyO3 DaemonHandle first, then falls back to the zs-fast-wheel binary
+    as a subprocess. Fails hard if neither is available — the daemon is required
+    for streaming large wheels.
+
+    Returns (daemon_handle_or_process, list_of_saved_whl_paths).
     """
     if not plan.fast_wheels:
         return None, []
 
+    # Try PyO3 module first
     try:
         from zs_fast_wheel import DaemonHandle
+
+        wheel_cache_dir.mkdir(parents=True, exist_ok=True)
+
+        wheels = [
+            {
+                "url": w.url,
+                "distribution": w.distribution,
+                "size": w.size,
+                "import_roots": w.import_roots,
+                "hash": w.hash,
+            }
+            for w in plan.fast_wheels
+        ]
+
+        daemon = DaemonHandle()
+        daemon.start(
+            wheels=wheels,
+            site_packages=str(site_packages),
+        )
+
+        log.info("[daemon] Started via PyO3 for %d large packages", len(plan.fast_wheels))
+
+        whl_paths = [
+            wheel_cache_dir / w.url.rsplit('/', 1)[-1]
+            for w in plan.fast_wheels
+        ]
+
+        return daemon, whl_paths
     except ImportError:
-        log.warning("zs_fast_wheel not available — falling back to uv for all wheels")
-        return None, []
+        pass
 
-    wheel_cache_dir.mkdir(parents=True, exist_ok=True)
+    # Fall back to binary subprocess
+    daemon_bin = _find_daemon_binary()
+    if not daemon_bin:
+        log.error(
+            "zs-fast-wheel daemon not available (no PyO3 module and no binary found). "
+            "Install via: cargo zigbuild --target x86_64-unknown-linux-musl --release -p zs-fast-wheel"
+        )
+        sys.exit(1)
 
-    wheels = [
-        {
-            "url": w.url,
-            "distribution": w.distribution,
-            "size": w.size,
-            "import_roots": w.import_roots,
-            "hash": w.hash,
-        }
-        for w in plan.fast_wheels
-    ]
+    import tempfile
 
-    daemon = DaemonHandle()
-    daemon.start(
-        wheels=wheels,
-        site_packages=str(site_packages),
+    # Write manifest for the binary
+    manifest = {
+        "site_packages": str(site_packages),
+        "wheels": [
+            {
+                "url": w.url,
+                "distribution": w.distribution,
+                "version": w.version,
+                "size": w.size,
+                "import_roots": w.import_roots,
+                "hash": w.hash,
+            }
+            for w in plan.fast_wheels
+        ],
+    }
+
+    manifest_file = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", prefix="zs-manifest-", delete=False
+    )
+    json.dump(manifest, manifest_file)
+    manifest_file.close()
+
+    log.info("[daemon] Starting binary %s for %d large packages", daemon_bin, len(plan.fast_wheels))
+
+    proc = subprocess.Popen(
+        [daemon_bin, "daemon", "--manifest", manifest_file.name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
 
-    log.info("[daemon] Started for %d large packages", len(plan.fast_wheels))
+    daemon = DaemonProcess(proc, manifest_file.name)
 
-    # Build expected .whl paths (daemon saves them here)
     whl_paths = [
         wheel_cache_dir / w.url.rsplit('/', 1)[-1]
         for w in plan.fast_wheels
@@ -304,8 +446,10 @@ def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | Non
     wheel_cache = ENV_CACHE_DIR / "wheels"
     daemon, whl_paths = _start_daemon(plan, site_packages, wheel_cache)
 
-    # Install lazy import hook (only for daemon-managed packages)
-    if daemon:
+    # Install lazy import hook (only for PyO3 daemon — subprocess daemon
+    # doesn't support per-package tracking, so we wait for it to finish below)
+    is_subprocess_daemon = isinstance(daemon, DaemonProcess) if daemon else False
+    if daemon and not is_subprocess_daemon:
         daemon_dists = {w.distribution for w in plan.fast_wheels}
         daemon_import_map = {
             k: v for k, v in plan.import_to_distribution.items()
@@ -322,6 +466,19 @@ def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | Non
         log.info("Waiting for uv to finish...")
         uv_thread.join(timeout=120)
         uv_thread = None
+
+    # Subprocess daemon: wait for ALL wheels to finish before running script.
+    # Unlike PyO3 daemon, subprocess can't track per-package progress.
+    if is_subprocess_daemon:
+        log.info("Waiting for daemon to finish extracting %d packages...", len(plan.fast_wheels))
+        daemon.wait_all(timeout_secs=300.0)
+        # Check daemon exit status
+        if hasattr(daemon, '_proc') and daemon._proc.returncode != 0:
+            stderr = daemon._proc.stderr.read().decode() if daemon._proc.stderr else ""
+            log.error("Daemon failed (exit %d): %s", daemon._proc.returncode, stderr[:500])
+            sys.exit(1)
+        log.info("Daemon finished — all packages ready")
+        daemon = None  # No cleanup needed later
 
     if not daemon:
         complete_marker.touch()

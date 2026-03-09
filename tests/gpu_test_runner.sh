@@ -41,33 +41,35 @@ else
 fi
 mkdir -p "$VOLDIR"
 
-# Create a fresh venv (the synced .venv has macOS python which breaks maturin)
+# Create a fresh venv
 echo "Creating fresh venv..."
 rm -rf "$VOLDIR/venv"
 python3 -m venv "$VOLDIR/venv"
 source "$VOLDIR/venv/bin/activate"
-pip install maturin 2>&1 | tail -1
 
-# Build PyO3 module first (zs-fast-wheel must exist before zerostart can import it)
-echo "Building zs-fast-wheel PyO3 module..."
-cd crates/zs-fast-wheel
-maturin develop --release 2>&1 | tail -3
-cd ../..
-echo "zs_fast_wheel built"
-
-# Install zerostart from source
+# Install zerostart Python package (no Rust build needed — uses uv-only fallback)
 echo "Installing zerostart..."
-pip install -e python/ 2>&1 | tail -1
+pip install -e python/ 2>&1
+if ! command -v zerostart &>/dev/null; then
+    echo "ERROR: zerostart not found after pip install"
+    echo "PATH=$PATH"
+    pip show zerostart 2>&1
+    exit 1
+fi
 echo "zerostart installed: $(which zerostart)"
 
-# Verify imports
-python3 -c "import zerostart; import zs_fast_wheel; print('imports ok')"
+# Verify import (zs_fast_wheel is optional — Python CLI falls back to uv-only mode)
+python3 -c "import zerostart; print('imports ok')"
 
-# Clean stale caches (may have wrong-arch wheels from previous runs)
-rm -rf .zerostart
+# Cross-compiled Rust binary is pre-built and synced via bin/ (no rustup needed)
+echo "Rust binary: $(ls -lh bin/zs-fast-wheel-linux-x86_64 2>/dev/null || echo 'not found')"
+
+# Use local (non-NFS) cache dir for test isolation
+export ZEROSTART_CACHE=/tmp/zerostart-cache
+rm -rf "$ZEROSTART_CACHE" .zerostart ~/.cache/zerostart
 
 # Cleanup helper — clear cache between tests for isolation
-cleanup_cache() { rm -rf .zerostart; }
+cleanup_cache() { rm -rf "$ZEROSTART_CACHE" .zerostart 2>/dev/null; true; }
 
 echo ""
 echo "=== 1. Basic Functionality ==="
@@ -332,7 +334,7 @@ assert requests.__version__ == "2.31.0", f"expected requests 2.31.0, got {reques
 print(f"numpy={np.__version__} requests={requests.__version__} — versions correct")
 PYEOF
 echo -e 'numpy==1.26.4\nrequests==2.31.0' > /tmp/reqs_pinned.txt
-rm -rf .zerostart
+cleanup_cache
 if zerostart -r /tmp/reqs_pinned.txt /tmp/test_pinned.py 2>&1; then
     pass "3.1 pinned versions"
 else
@@ -342,7 +344,7 @@ fi
 # --- 3.2 Version upgrade — cache invalidation ---
 echo ""
 echo "--- 3.2 Version upgrade cache invalidation ---"
-rm -rf .zerostart
+cleanup_cache
 
 # Run 1: numpy 1.26.4
 echo 'numpy==1.26.4' > /tmp/reqs_v1.txt
@@ -352,7 +354,7 @@ print(f"v1: numpy={np.__version__}")
 assert np.__version__ == "1.26.4"
 PYEOF
 zerostart -r /tmp/reqs_v1.txt /tmp/test_v1.py 2>&1
-ENVS_AFTER_V1=$(ls .zerostart/envs/ 2>/dev/null | wc -l)
+ENVS_AFTER_V1=$(ls "$ZEROSTART_CACHE/envs/" 2>/dev/null | wc -l)
 
 # Run 2: numpy 1.26.3 (different version)
 echo 'numpy==1.26.3' > /tmp/reqs_v2.txt
@@ -362,7 +364,7 @@ print(f"v2: numpy={np.__version__}")
 assert np.__version__ == "1.26.3"
 PYEOF
 zerostart -r /tmp/reqs_v2.txt /tmp/test_v2.py 2>&1
-ENVS_AFTER_V2=$(ls .zerostart/envs/ 2>/dev/null | wc -l)
+ENVS_AFTER_V2=$(ls "$ZEROSTART_CACHE/envs/" 2>/dev/null | wc -l)
 
 if [ "$ENVS_AFTER_V2" -gt "$ENVS_AFTER_V1" ]; then
     pass "3.2 version upgrade creates new cache"
@@ -373,12 +375,12 @@ fi
 # --- 3.3 Adding a package ---
 echo ""
 echo "--- 3.3 Adding a package to requirements ---"
-rm -rf .zerostart
+cleanup_cache
 
 echo 'six' > /tmp/reqs_add1.txt
 echo 'import six; print(f"six={six.__version__}")' > /tmp/test_add.py
 zerostart -r /tmp/reqs_add1.txt /tmp/test_add.py 2>&1
-ENVS_1=$(ls .zerostart/envs/ 2>/dev/null | wc -l)
+ENVS_1=$(ls "$ZEROSTART_CACHE/envs/" 2>/dev/null | wc -l)
 
 echo -e 'six\nidna' > /tmp/reqs_add2.txt
 cat > /tmp/test_add2.py << 'PYEOF'
@@ -386,7 +388,7 @@ import six, idna
 print(f"six={six.__version__} idna={idna.__version__}")
 PYEOF
 zerostart -r /tmp/reqs_add2.txt /tmp/test_add2.py 2>&1
-ENVS_2=$(ls .zerostart/envs/ 2>/dev/null | wc -l)
+ENVS_2=$(ls "$ZEROSTART_CACHE/envs/" 2>/dev/null | wc -l)
 
 if [ "$ENVS_2" -gt "$ENVS_1" ]; then
     pass "3.3 adding package creates new cache"
@@ -397,7 +399,7 @@ fi
 # --- 3.4 Warm cache hit ---
 echo ""
 echo "--- 3.4 Warm cache hit ---"
-rm -rf .zerostart
+cleanup_cache
 echo 'import six; print(f"six={six.__version__}")' > /tmp/test_warm.py
 echo 'six' > /tmp/reqs_warm.txt
 
@@ -421,7 +423,7 @@ else
 fi
 
 # Clean up caches before heavy tests
-rm -rf .zerostart
+cleanup_cache
 
 echo ""
 echo "=== 4. Progressive Loading ==="
