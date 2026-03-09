@@ -19,10 +19,9 @@ cd crates && cargo clippy --workspace -- -D warnings
 cd crates && cargo fmt --workspace
 ```
 
-Cross-compile for Linux (musl static binary):
+Cross-compile for Linux (musl static binary) — **always do this before `gpu run`**, never compile Rust on RunPod:
 ```bash
-cd crates && cargo zigbuild --target x86_64-unknown-linux-musl --release -p zs-fast-wheel
-cp crates/target/x86_64-unknown-linux-musl/release/zs-fast-wheel bin/zs-fast-wheel-linux-x86_64
+./scripts/cross-compile.sh
 ```
 
 Python SDK:
