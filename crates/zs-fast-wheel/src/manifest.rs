@@ -9,6 +9,9 @@ pub struct WheelSpec {
     pub url: String,
     /// Distribution name (e.g., "torch", "requests")
     pub distribution: String,
+    /// Package version (e.g., "2.4.1")
+    #[serde(default)]
+    pub version: String,
     /// Top-level import names (e.g., ["torch"], ["PIL"])
     #[serde(default)]
     pub import_roots: Vec<String>,

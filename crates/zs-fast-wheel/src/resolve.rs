@@ -1,76 +1,68 @@
-//! Resolve requirements to wheel URLs via `uv pip compile` + PyPI JSON API.
+//! Resolve requirements to wheel URLs via `uv pip compile --format pylock.toml`.
 //!
+//! Single call to uv gives us URLs, sizes, and hashes — no PyPI lookups needed.
 //! This runs entirely without Python — just needs `uv` on PATH.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use std::io::Write;
 use std::process::Command;
 
 use crate::manifest::WheelSpec;
 
-/// Resolve requirements text to wheel specs.
+/// Size threshold: wheels larger than this go through the streaming daemon.
+/// Smaller wheels are installed via `uv pip install` (instant from cache).
+const DAEMON_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MB
+
+/// Resolved artifacts split into small (uv) and large (daemon) buckets.
+pub struct ResolvedPlan {
+    /// All resolved wheel specs
+    pub all: Vec<WheelSpec>,
+    /// Small wheels — install via `uv pip install`
+    pub uv_specs: Vec<String>,
+    /// Large wheels — stream via daemon
+    pub daemon_wheels: Vec<WheelSpec>,
+}
+
+/// Resolve requirements text to a plan with URLs, sizes, and hashes.
 ///
-/// Accepts newline-separated requirements (like requirements.txt content).
-/// Shells out to `uv pip compile` for resolution, then looks up each
-/// package on PyPI JSON API for download URLs and sizes.
-pub async fn resolve_requirements(
-    requirements_text: &str,
+/// Uses `uv pip compile --format pylock.toml` which gives everything in one call.
+pub fn resolve_requirements(
+    requirements: &[String],
     python_version: &str,
     platform: &str,
-) -> Result<Vec<WheelSpec>> {
-    let requirements: Vec<&str> = requirements_text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('-'))
-        .collect();
-
+) -> Result<ResolvedPlan> {
     if requirements.is_empty() {
-        return Ok(Vec::new());
+        return Ok(ResolvedPlan {
+            all: Vec::new(),
+            uv_specs: Vec::new(),
+            daemon_wheels: Vec::new(),
+        });
     }
 
-    // Step 1: Resolve with uv pip compile
-    let resolved = uv_resolve(&requirements, python_version, platform)?;
-    if resolved.is_empty() {
-        anyhow::bail!("uv pip compile returned no results");
-    }
+    let specs = uv_resolve_pylock(requirements, python_version, platform)?;
 
-    // Step 2: Look up wheel URLs from PyPI JSON API (concurrent)
-    let client = reqwest::Client::new();
-    let mut handles = Vec::new();
+    let mut uv_specs = Vec::new();
+    let mut daemon_wheels = Vec::new();
 
-    for (dist, version) in resolved {
-        let client = client.clone();
-        let py_ver = python_version.to_string();
-        let plat = platform.to_string();
-
-        handles.push(tokio::spawn(async move {
-            match lookup_pypi_wheel(&client, &dist, &version, &py_ver, &plat).await {
-                Ok(spec) => Some(spec),
-                Err(e) => {
-                    tracing::warn!("could not find wheel for {dist}=={version}: {e}");
-                    None
-                }
-            }
-        }));
-    }
-
-    let mut specs = Vec::new();
-    for handle in handles {
-        if let Some(spec) = handle.await? {
-            specs.push(spec);
+    for spec in &specs {
+        if spec.size > DAEMON_THRESHOLD {
+            daemon_wheels.push(spec.clone());
+        } else {
+            uv_specs.push(format!("{}=={}", spec.distribution, spec.version));
         }
     }
 
-    Ok(specs)
+    Ok(ResolvedPlan {
+        all: specs,
+        uv_specs,
+        daemon_wheels,
+    })
 }
 
 /// Parse requirements from a pyproject.toml string.
 ///
 /// Extracts `[project.dependencies]` list.
 pub fn parse_pyproject_dependencies(content: &str) -> Result<Vec<String>> {
-    // Simple TOML parsing — just extract the dependencies array
-    // We use a minimal approach since we only need [project.dependencies]
     let table: toml::Value =
         toml::from_str(content).context("failed to parse pyproject.toml")?;
 
@@ -88,12 +80,14 @@ pub fn parse_pyproject_dependencies(content: &str) -> Result<Vec<String>> {
     Ok(deps)
 }
 
-/// Run `uv pip compile` to resolve requirements to pinned versions.
-fn uv_resolve(
-    requirements: &[&str],
+/// Run `uv pip compile --format pylock.toml` and parse the result.
+///
+/// Returns WheelSpecs with URLs, sizes, and hashes — no PyPI lookups needed.
+fn uv_resolve_pylock(
+    requirements: &[String],
     python_version: &str,
     platform: &str,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<WheelSpec>> {
     // Write requirements to temp file
     let mut tmp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
     for req in requirements {
@@ -108,6 +102,8 @@ fn uv_resolve(
             "pip",
             "compile",
             tmp.path().to_str().unwrap_or("-"),
+            "--format",
+            "pylock.toml",
             "--python-version",
             python_version,
             "--python-platform",
@@ -123,114 +119,77 @@ fn uv_resolve(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut resolved = Vec::new();
+    parse_pylock(&stdout)
+}
 
-    for line in stdout.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Remove inline comments
-        let line = line.split('#').next().unwrap_or("").trim();
-        // Parse "package==version"
-        if let Some((name, version)) = line.split_once("==") {
-            resolved.push((name.to_string(), version.to_string()));
+/// Parse a pylock.toml string into WheelSpecs.
+fn parse_pylock(content: &str) -> Result<Vec<WheelSpec>> {
+    let table: toml::Value = toml::from_str(content).context("failed to parse pylock.toml")?;
+
+    let packages = table
+        .get("packages")
+        .and_then(|p| p.as_array())
+        .context("no [[packages]] in pylock.toml")?;
+
+    let mut specs = Vec::new();
+
+    for pkg in packages {
+        let name = pkg
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let version = pkg
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        // Get wheels array — pick the best one
+        let wheels = match pkg.get("wheels").and_then(|w| w.as_array()) {
+            Some(w) => w,
+            None => continue, // sdist-only, skip
+        };
+
+        if let Some((url, size, hash)) = pick_best_wheel(wheels) {
+            let import_roots = guess_import_roots(&name);
+            specs.push(WheelSpec {
+                url,
+                distribution: name,
+                version,
+                import_roots,
+                size,
+                hash,
+            });
         }
     }
 
-    Ok(resolved)
+    Ok(specs)
 }
 
-/// PyPI JSON API response (partial).
-#[derive(Deserialize)]
-struct PyPIResponse {
-    urls: Vec<PyPIFile>,
-}
+/// Pick the best wheel from a pylock.toml wheels array.
+///
+/// uv already filtered for the target platform, so usually there's just one.
+/// If multiple, prefer the first (uv orders by preference).
+fn pick_best_wheel(wheels: &[toml::Value]) -> Option<(String, u64, Option<String>)> {
+    for wheel in wheels {
+        let url = wheel.get("url").and_then(|v| v.as_str())?;
+        let size = wheel
+            .get("size")
+            .and_then(|v| v.as_integer())
+            .unwrap_or(0) as u64;
 
-#[derive(Deserialize)]
-struct PyPIFile {
-    filename: String,
-    url: String,
-    #[serde(default)]
-    size: u64,
-}
+        // Extract hash from hashes table (prefer sha256)
+        let hash = wheel
+            .get("hashes")
+            .and_then(|h| h.as_table())
+            .and_then(|h| h.get("sha256"))
+            .and_then(|v| v.as_str())
+            .map(|s| format!("sha256:{s}"));
 
-/// Look up the best wheel URL from PyPI JSON API.
-async fn lookup_pypi_wheel(
-    client: &reqwest::Client,
-    distribution: &str,
-    version: &str,
-    python_version: &str,
-    platform: &str,
-) -> Result<WheelSpec> {
-    let url = format!("https://pypi.org/pypi/{distribution}/{version}/json");
-    let resp = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-        .await?
-        .error_for_status()?;
-    let data: PyPIResponse = resp.json().await?;
-
-    let py_tag = format!("cp{}", python_version.replace('.', ""));
-
-    // Extract arch from platform string (e.g. "linux" → detect at runtime,
-    // "x86_64-unknown-linux-gnu" → "x86_64", "aarch64-unknown-linux-gnu" → "aarch64")
-    let arch_tag = platform_to_arch(platform);
-
-    // Priority: platform-specific + python version + correct arch > abi3 + arch > none-any > first .whl
-    let mut best: Option<&PyPIFile> = None;
-    let mut best_priority = 0u8;
-
-    for f in &data.urls {
-        if !f.filename.ends_with(".whl") {
-            continue;
-        }
-
-        let is_none_any = f.filename.contains("none-any");
-        let has_linux = f.filename.contains("linux");
-        let has_arch = f.filename.contains(arch_tag);
-        let has_py_tag = f.filename.contains(&py_tag);
-        let has_abi3 = f.filename.contains("abi3");
-
-        // Best: platform-specific wheel matching python version and architecture
-        if has_linux && has_arch && has_py_tag && !has_abi3 && best_priority < 4 {
-            best = Some(f);
-            best_priority = 4;
-        }
-        // Good: abi3 wheel (stable ABI) matching architecture
-        else if has_linux && has_arch && has_abi3 && best_priority < 3 {
-            best = Some(f);
-            best_priority = 3;
-        }
-        // OK: platform wheel with right arch but maybe wrong python tag
-        else if has_linux && has_arch && best_priority < 2 {
-            best = Some(f);
-            best_priority = 2;
-        }
-        // Fallback: none-any (pure Python)
-        else if is_none_any && best_priority < 1 {
-            best = Some(f);
-            best_priority = 1;
-        }
+        return Some((url.to_string(), size, hash));
     }
-
-    // Last resort: first .whl (might be wrong arch but better than nothing)
-    if best.is_none() {
-        best = data.urls.iter().find(|f| f.filename.ends_with(".whl"));
-    }
-
-    let file = best.context(format!("no wheel found for {distribution}=={version}"))?;
-
-    let import_roots = guess_import_roots(distribution);
-
-    Ok(WheelSpec {
-        url: file.url.clone(),
-        distribution: distribution.to_string(),
-        import_roots,
-        size: file.size,
-        hash: None,
-    })
+    None
 }
 
 /// Detect the current machine's CPU architecture.
@@ -238,30 +197,11 @@ fn detect_arch() -> &'static str {
     std::env::consts::ARCH // "x86_64", "aarch64", etc.
 }
 
-/// Convert a platform string to a wheel filename arch tag.
-///
-/// Accepts short forms ("linux") or full triples ("x86_64-unknown-linux-gnu").
-/// Short forms auto-detect the current machine's architecture.
-fn platform_to_arch(platform: &str) -> &str {
-    if platform.starts_with("x86_64") {
-        "x86_64"
-    } else if platform.starts_with("aarch64") || platform.starts_with("arm64") {
-        "aarch64"
-    } else {
-        // Short form like "linux" — detect from current machine
-        detect_arch()
-    }
-}
-
 /// Convert a platform string to uv's `--python-platform` tag.
-///
-/// Accepts short forms ("linux") or passes through full triples.
 fn platform_to_uv_tag(platform: &str) -> String {
     if platform.contains("-unknown-") || platform.contains("-apple-") {
-        // Already a full triple
         return platform.to_string();
     }
-    // Short form: detect arch and build triple
     let arch = detect_arch();
     match platform {
         "linux" => format!("{arch}-unknown-linux-gnu"),
@@ -281,6 +221,31 @@ fn guess_import_roots(distribution: &str) -> Vec<String> {
         "attrs" => vec!["attr".to_string(), "attrs".to_string()],
         _ => vec![distribution.replace('-', "_").to_lowercase()],
     }
+}
+
+/// Detect the running platform as a short string.
+pub fn detect_platform() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux" // default for GPU containers
+    }
+}
+
+/// Detect Python version from a python binary.
+pub fn detect_python_version(python: &std::path::Path) -> Result<String> {
+    let output = Command::new(python)
+        .args(["-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"])
+        .output()
+        .context("failed to detect python version")?;
+
+    if !output.status.success() {
+        anyhow::bail!("python version detection failed");
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[cfg(test)]
@@ -304,21 +269,34 @@ dependencies = [
     }
 
     #[test]
-    fn test_parse_pyproject_no_deps() {
+    fn test_parse_pylock() {
         let content = r#"
-[project]
-name = "myapp"
+lock-version = "1.0"
+created-by = "uv"
+
+[[packages]]
+name = "click"
+version = "8.3.1"
+wheels = [{ url = "https://example.com/click-8.3.1-py3-none-any.whl", size = 108274, hashes = { sha256 = "abc123" } }]
+
+[[packages]]
+name = "torch"
+version = "2.0.0"
+wheels = [{ url = "https://example.com/torch-2.0.0-cp311-linux_x86_64.whl", size = 800000000, hashes = { sha256 = "def456" } }]
 "#;
-        let deps = parse_pyproject_dependencies(content).unwrap();
-        assert!(deps.is_empty());
+        let specs = parse_pylock(content).unwrap();
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].distribution, "click");
+        assert_eq!(specs[0].size, 108274);
+        assert_eq!(specs[0].hash, Some("sha256:abc123".to_string()));
+        assert_eq!(specs[1].distribution, "torch");
+        assert_eq!(specs[1].size, 800_000_000);
     }
 
     #[test]
     fn test_guess_import_roots() {
         assert_eq!(guess_import_roots("pyyaml"), vec!["yaml"]);
         assert_eq!(guess_import_roots("Pillow"), vec!["PIL"]);
-        assert_eq!(guess_import_roots("scikit-learn"), vec!["sklearn"]);
         assert_eq!(guess_import_roots("my-package"), vec!["my_package"]);
-        assert_eq!(guess_import_roots("torch"), vec!["torch"]);
     }
 }

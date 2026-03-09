@@ -1,36 +1,43 @@
-"""Orchestrator: resolve → start DaemonHandle → lazy import hook → run.
+"""Orchestrator: uv for caching + daemon for streaming extraction + progressive loading.
+
+Uses uv's cache for warm starts (instant hardlinks) and our daemon for cold starts
+(streaming download+extraction with progressive loading).
 
 Supports two modes:
 - Script mode: `zerostart serve.py` — run a Python script with progressive loading
 - Package mode: `zerostart comfyui` — install package, discover entry point, run it
 
-Both modes use the same pipeline: resolve deps, cache venv, stream large
-wheels via the Rust daemon, install small wheels via uv, and gate imports
-with the lazy import hook for progressive loading.
+Flow:
+  WARM (uv cache populated):
+    uv venv → uv pip install (resolved 1ms, installed 5ms via hardlinks) → exec
+  COLD (no cache):
+    uv venv → uv pip install small wheels + daemon streams large wheels → progressive loading
+    After daemon finishes: uv pip install saved .whls → populates uv cache for next time
 
 Usage:
     zerostart serve.py                          # script with PEP 723 deps
     zerostart -r requirements.txt serve.py      # script with requirements file
-    zerostart -p torch -p transformers serve.py  # script with explicit deps
+    zerostart -p torch -p transformers serve.py # script with explicit deps
     zerostart comfyui                           # package mode (like uvx)
-    zerostart -p torch comfyui                   # package mode with extra deps
+    zerostart -p torch comfyui                  # package mode with extra deps
     zerostart vllm serve meta-llama/Llama-3-8B  # package mode with args
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
+import os
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 
-from zerostart.cache import CachedEnv, EnvironmentCache
 from zerostart.entrypoints import (
     EntryPointError,
     discover_entry_point,
@@ -41,23 +48,40 @@ from zerostart.resolver import ArtifactPlan, resolve_requirements
 
 log = logging.getLogger("zerostart")
 
+# Environment cache directory — stores our venvs keyed by requirements
+ENV_CACHE_DIR = Path(os.environ.get("ZEROSTART_CACHE", os.path.expanduser("~/.cache/zerostart")))
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _find_uv() -> str | None:
-    return shutil.which("uv")
+def _find_uv() -> str:
+    uv = shutil.which("uv")
+    if not uv:
+        log.error("uv is required but not found on PATH")
+        sys.exit(1)
+    return uv
 
 
 def _is_script(target: str) -> bool:
     """Determine if target is a Python script (vs a package name)."""
     if target.endswith(".py"):
         return True
-    # A file that exists on disk is treated as a script
     if Path(target).is_file():
         return True
     return False
+
+
+def _env_key(requirements: list[str]) -> str:
+    """Hash requirements to get a stable environment key."""
+    payload = json.dumps(sorted(requirements), sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def _find_site_packages(venv: Path) -> Path | None:
+    candidates = list(venv.glob("lib/python*/site-packages"))
+    return candidates[0] if candidates else None
 
 
 def parse_requirements(path: str) -> list[str]:
@@ -73,38 +97,25 @@ def parse_requirements(path: str) -> list[str]:
 
 
 def parse_inline_metadata(script: str) -> list[str]:
-    """Parse PEP 723 inline script metadata from a Python script.
-
-    Looks for a block like:
-        # /// script
-        # dependencies = ["torch", "transformers>=4.0"]
-        # ///
-
-    Returns list of dependency specifiers, or empty list if none found.
-    """
+    """Parse PEP 723 inline script metadata from a Python script."""
     try:
         with open(script) as f:
             content = f.read()
     except (FileNotFoundError, PermissionError):
         return []
 
-    # Match the /// script ... /// block (PEP 723 format)
     pattern = r'(?m)^# /// script\s*\n((?:#[^\n]*\n)*)# ///'
     match = re.search(pattern, content)
     if not match:
         return []
 
-    # Strip leading "# " from each line to get TOML content
     block = match.group(1)
     toml_lines = []
     for line in block.splitlines():
-        # Remove leading "# " or "#"
         stripped = re.sub(r'^#\s?', '', line)
         toml_lines.append(stripped)
     toml_content = '\n'.join(toml_lines)
 
-    # Parse the dependencies array from TOML-like content
-    # Full TOML parsing is overkill — just extract the dependencies list
     deps_match = re.search(
         r'dependencies\s*=\s*\[(.*?)\]',
         toml_content,
@@ -113,63 +124,95 @@ def parse_inline_metadata(script: str) -> list[str]:
     if not deps_match:
         return []
 
-    # Extract quoted strings from the array
     raw = deps_match.group(1)
     matches = re.findall(r'"([^"]+)"|\'([^\']+)\'', raw)
-    # re.findall with alternation returns tuples — take whichever group matched
     return [double or single for double, single in matches]
 
 
 # ---------------------------------------------------------------------------
-# Installation helpers
+# Environment management (backed by uv)
 # ---------------------------------------------------------------------------
 
-def _install_uv_wheels(
-    plan: ArtifactPlan,
-    site_packages: Path,
-    venv_dir: Path,
-) -> None:
-    """Install small wheels via uv pip install (runs in background thread)."""
+def _get_or_create_venv(requirements: list[str]) -> Path:
+    """Get or create a venv for these requirements.
+
+    Uses uv venv + uv pip install. On warm path (uv cache populated),
+    this is instant — uv resolves in <2ms and hardlinks from its cache.
+    """
+    key = _env_key(requirements)
+    venv = ENV_CACHE_DIR / "envs" / key
+    complete_marker = venv / ".complete"
+
+    if complete_marker.exists():
+        return venv
+
     uv = _find_uv()
-    if not uv:
-        log.warning("uv not found — skipping small wheel install")
-        return
 
-    if not plan.uv_wheels:
-        return
+    # Create venv if needed
+    if not venv.exists():
+        log.info("Creating environment...")
+        subprocess.run(
+            [uv, "venv", str(venv), "--python", f"{sys.version_info.major}.{sys.version_info.minor}"],
+            capture_output=True,
+            check=True,
+        )
 
-    specs = [f"{w.distribution}=={w.version}" for w in plan.uv_wheels]
-    python = str(venv_dir / "bin" / "python")
+    return venv
 
-    log.info("[uv] Installing %d small packages...", len(specs))
-    t0 = time.monotonic()
 
-    result = subprocess.run(
+def _uv_install(venv: Path, specs: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run uv pip install into a venv. Leverages uv's global cache."""
+    uv = _find_uv()
+    python = str(venv / "bin" / "python")
+    return subprocess.run(
         [uv, "pip", "install", "--python", python] + specs,
         capture_output=True,
         text=True,
     )
 
-    elapsed = time.monotonic() - t0
+
+def _uv_install_background(venv: Path, whl_paths: list[Path]) -> None:
+    """Install local .whl files via uv to populate its cache for next run."""
+    if not whl_paths:
+        return
+    uv = _find_uv()
+    python = str(venv / "bin" / "python")
+    specs = [str(p) for p in whl_paths if p.exists()]
+    if not specs:
+        return
+
+    log.info("[uv-cache] Registering %d wheels with uv cache...", len(specs))
+    result = subprocess.run(
+        [uv, "pip", "install", "--python", python, "--reinstall"] + specs,
+        capture_output=True,
+        text=True,
+    )
     if result.returncode == 0:
-        log.info("[uv] %d packages installed (%.1fs)", len(specs), elapsed)
+        log.info("[uv-cache] Done — next run will be instant")
     else:
-        log.error("[uv] Install failed (%.1fs): %s", elapsed, result.stderr[:500])
+        log.warning("[uv-cache] Failed: %s", result.stderr[:200])
 
 
-def _start_daemon(plan: ArtifactPlan, site_packages: Path) -> object | None:
-    """Start the Rust DaemonHandle for large wheels. Returns handle or None."""
+# ---------------------------------------------------------------------------
+# Installation: uv for small wheels, daemon for large wheels
+# ---------------------------------------------------------------------------
+
+def _start_daemon(plan: ArtifactPlan, site_packages: Path, wheel_cache_dir: Path) -> tuple[object | None, list[Path]]:
+    """Start the Rust DaemonHandle for large wheels.
+
+    Returns (daemon_handle, list_of_saved_whl_paths).
+    The daemon saves .whl files to wheel_cache_dir so we can feed them to uv later.
+    """
     if not plan.fast_wheels:
-        return None
+        return None, []
 
     try:
         from zs_fast_wheel import DaemonHandle
     except ImportError:
-        log.warning(
-            "zs_fast_wheel not available — falling back to uv for all %d wheels",
-            len(plan.fast_wheels),
-        )
-        return None
+        log.warning("zs_fast_wheel not available — falling back to uv for all wheels")
+        return None, []
+
+    wheel_cache_dir.mkdir(parents=True, exist_ok=True)
 
     wheels = [
         {
@@ -189,67 +232,52 @@ def _start_daemon(plan: ArtifactPlan, site_packages: Path) -> object | None:
     )
 
     log.info("[daemon] Started for %d large packages", len(plan.fast_wheels))
-    return daemon
+
+    # Build expected .whl paths (daemon saves them here)
+    whl_paths = [
+        wheel_cache_dir / w.url.rsplit('/', 1)[-1]
+        for w in plan.fast_wheels
+    ]
+
+    return daemon, whl_paths
 
 
 # ---------------------------------------------------------------------------
-# Prepared environment
+# Core: prepare environment
 # ---------------------------------------------------------------------------
 
-@dataclass
-class PreparedEnv:
-    """Result of prepare_env(): everything needed to run a script or entry point."""
-    site_packages: Path
-    env: CachedEnv
-    cache: EnvironmentCache
-    plan: ArtifactPlan
-    requirements: list[str] = dc_field(default_factory=list)
-    daemon: object | None = None
-    hook: object | None = None
-    uv_thread: threading.Thread | None = None
-    is_cached: bool = False
+def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | None, object | None, list[Path], threading.Thread | None]:
+    """Prepare environment for running.
 
+    Returns (venv, site_packages, plan, daemon, whl_paths, uv_thread).
 
-def prepare_env(
-    requirements: list[str],
-    cache_dir: str | None = None,
-) -> PreparedEnv:
-    """Resolve requirements, set up cache/daemon/uv/hook.
-
-    Shared pipeline for both script mode and package mode.
-    Returns PreparedEnv ready for script exec or entry point invocation.
+    WARM path: uv pip install is instant from cache. No daemon.
+    COLD path: uv handles small wheels, daemon streams large wheels.
     """
-    cache = EnvironmentCache(Path(cache_dir) if cache_dir else None)
+    uv = _find_uv()
+    venv = _get_or_create_venv(requirements)
+    site_packages = _find_site_packages(venv)
+    complete_marker = venv / ".complete"
 
-    # Fast warm path: check input hash before resolving
-    cached = cache.lookup_by_input(requirements)
-    if cached:
-        log.info("Cache hit — skipping resolution")
-        sys.path.insert(0, str(cached.site_packages))
-        return PreparedEnv(
-            site_packages=cached.site_packages,
-            env=cached,
-            cache=cache,
-            plan=ArtifactPlan(artifacts=[], python_version="3.11", platform="linux"),
-            requirements=requirements,
-            is_cached=True,
-        )
+    if not site_packages:
+        log.error("Could not find site-packages in %s", venv)
+        sys.exit(1)
 
-    # Cold path: resolve requirements
+    # Try uv-only fast path first
+    if complete_marker.exists():
+        log.info("Cache hit — environment ready")
+        sys.path.insert(0, str(site_packages))
+        return venv, site_packages, None, None, [], None
+
+    # Cold path: resolve to figure out which wheels need daemon
     log.info("Resolving %d requirements...", len(requirements))
     plan = resolve_requirements(requirements)
 
     if not plan.artifacts:
         log.warning("No artifacts resolved")
-        env = cache.create_env(plan)
-        return PreparedEnv(
-            site_packages=env.site_packages,
-            env=env,
-            cache=cache,
-            plan=plan,
-            requirements=requirements,
-            is_cached=False,
-        )
+        complete_marker.touch()
+        sys.path.insert(0, str(site_packages))
+        return venv, site_packages, plan, None, [], None
 
     log.info(
         "Resolved: %d packages (%d small via uv, %d large via daemon)",
@@ -258,120 +286,94 @@ def prepare_env(
         len(plan.fast_wheels),
     )
 
-    # Check plan-keyed cache (handles case where input changed but resolved same)
-    cached = cache.lookup(plan)
-    if cached and cached.is_complete:
-        log.info("Cache hit — using cached environment")
-        cache.save_input_mapping(requirements, plan)
-        sys.path.insert(0, str(cached.site_packages))
-        return PreparedEnv(
-            site_packages=cached.site_packages,
-            env=cached,
-            cache=cache,
-            plan=plan,
-            requirements=requirements,
-            is_cached=True,
-        )
-
-    # Cold path: create env and install progressively
-    env = cached if cached else cache.create_env(plan)
-    site_packages = env.site_packages
     sys.path.insert(0, str(site_packages))
 
-    # Start uv for small wheels in background
+    # Install only SMALL wheels via uv (fast, metadata-sensitive)
+    # Large wheels go through the daemon for streaming extraction
     uv_thread = None
-    if plan.uv_wheels:
+    small_specs = [f"{w.distribution}=={w.version}" for w in plan.uv_wheels]
+    if small_specs:
         uv_thread = threading.Thread(
-            target=_install_uv_wheels,
-            args=(plan, site_packages, env.env_dir),
+            target=_run_uv_install,
+            args=(venv, small_specs),
             daemon=True,
         )
         uv_thread.start()
 
-    # Start Rust daemon for large wheels
-    daemon = _start_daemon(plan, site_packages)
+    # Start daemon for large wheels (streams in parallel with uv)
+    wheel_cache = ENV_CACHE_DIR / "wheels"
+    daemon, whl_paths = _start_daemon(plan, site_packages, wheel_cache)
 
-    # If daemon unavailable but we have large wheels, install them via uv too
-    if not daemon and plan.fast_wheels:
-        _install_large_via_uv(plan, site_packages, env.env_dir)
+    # Install lazy import hook (only for daemon-managed packages)
+    if daemon:
+        daemon_dists = {w.distribution for w in plan.fast_wheels}
+        daemon_import_map = {
+            k: v for k, v in plan.import_to_distribution.items()
+            if v in daemon_dists
+        }
+        install_hook(
+            daemon=daemon,
+            import_map=daemon_import_map,
+        )
 
-    # Install lazy import hook (only when daemon is running)
-    hook = install_hook(
-        daemon=daemon,
-        import_map=plan.import_to_distribution,
-    ) if daemon else None
-
-    # If no daemon (all via uv), wait for uv to finish
-    if not daemon and uv_thread:
-        log.info("Waiting for uv to finish (no daemon)...")
+    # Always wait for uv to finish — small packages aren't covered by
+    # the lazy import hook, so they must be on disk before the script starts
+    if uv_thread:
+        log.info("Waiting for uv to finish...")
         uv_thread.join(timeout=120)
         uv_thread = None
 
-    return PreparedEnv(
-        site_packages=site_packages,
-        env=env,
-        cache=cache,
-        plan=plan,
-        requirements=requirements,
-        daemon=daemon,
-        hook=hook,
-        uv_thread=uv_thread,
-        is_cached=False,
-    )
+    if not daemon:
+        complete_marker.touch()
+
+    return venv, site_packages, plan, daemon, whl_paths, uv_thread
 
 
-def _install_large_via_uv(
-    plan: ArtifactPlan,
-    site_packages: Path,
-    venv_dir: Path,
-) -> None:
-    """Fallback: install large wheels via uv when daemon is unavailable."""
-    uv = _find_uv()
-    if not uv:
-        log.error("Neither zs_fast_wheel nor uv available — cannot install large wheels")
-        return
-
-    specs = [f"{w.distribution}=={w.version}" for w in plan.fast_wheels]
-    python = str(venv_dir / "bin" / "python")
-
-    log.info("[uv-fallback] Installing %d large packages...", len(specs))
+def _run_uv_install(venv: Path, specs: list[str]) -> None:
+    """Run uv pip install (for use in background thread)."""
     t0 = time.monotonic()
-
-    result = subprocess.run(
-        [uv, "pip", "install", "--python", python] + specs,
-        capture_output=True,
-        text=True,
-    )
-
+    result = _uv_install(venv, specs)
     elapsed = time.monotonic() - t0
     if result.returncode == 0:
-        log.info("[uv-fallback] %d packages installed (%.1fs)", len(specs), elapsed)
+        log.info("[uv] %d packages installed (%.1fs)", len(specs), elapsed)
     else:
-        log.error("[uv-fallback] Install failed (%.1fs): %s", elapsed, result.stderr[:500])
+        log.error("[uv] Install failed (%.1fs): %s", elapsed, result.stderr[:500])
 
 
-def cleanup_env(prepared: PreparedEnv, t0: float) -> None:
-    """Shared cleanup: remove hook, wait for threads/daemon, mark complete."""
+def cleanup(
+    venv: Path,
+    plan: ArtifactPlan | None,
+    daemon: object | None,
+    uv_thread: threading.Thread | None,
+    whl_paths: list[Path],
+    t0: float,
+) -> None:
+    """Cleanup: wait for daemon/uv, mark complete, populate uv cache."""
     total = time.monotonic() - t0
     log.info("Finished in %.1fs", total)
 
-    report = remove_hook() if prepared.hook else None
+    report = remove_hook()
 
-    if prepared.uv_thread:
-        prepared.uv_thread.join(timeout=30)
+    if uv_thread:
+        uv_thread.join(timeout=30)
 
-    if prepared.daemon:
+    if daemon:
         try:
-            prepared.daemon.wait_all(timeout_secs=60.0)
+            daemon.wait_all(timeout_secs=60.0)
         except Exception:
             pass
-        prepared.daemon.shutdown()
+        daemon.shutdown()
 
-    prepared.cache.mark_complete(prepared.env)
+    # Populate uv's cache by installing ALL resolved specs.
+    # This runs after the app finishes so it doesn't slow down cold start.
+    # Next run will be instant — uv hardlinks from its cache.
+    if plan and plan.artifacts:
+        all_specs = [f"{w.distribution}=={w.version}" for w in plan.artifacts]
+        log.info("[uv-cache] Populating uv cache with %d packages...", len(all_specs))
+        _run_uv_install(venv, all_specs)
 
-    # Save input → env mapping for fast warm path on next run
-    if prepared.requirements and prepared.plan.artifacts:
-        prepared.cache.save_input_mapping(prepared.requirements, prepared.plan)
+    # Mark environment as complete
+    (venv / ".complete").touch()
 
     if report:
         log.info("Import wait times:")
@@ -387,7 +389,6 @@ def run(
     script: str,
     requirements: list[str] | None = None,
     requirements_file: str | None = None,
-    cache_dir: str | None = None,
 ) -> None:
     """Run a Python script with lazy imports and progressive installation."""
     if requirements is None:
@@ -407,9 +408,10 @@ def run(
         exec(compile(open(script).read(), script, "exec"), {"__name__": "__main__"})
         return
 
-    prepared = prepare_env(requirements, cache_dir=cache_dir)
+    venv, site_packages, plan, daemon, whl_paths, uv_thread = prepare_env(requirements)
 
-    if prepared.is_cached:
+    if not daemon:
+        # Warm path or all-uv — just run
         exec(compile(open(script).read(), script, "exec"), {"__name__": "__main__"})
         return
 
@@ -420,7 +422,7 @@ def run(
         script_globals = {"__name__": "__main__", "__file__": script}
         exec(compile(open(script).read(), script, "exec"), script_globals)
     finally:
-        cleanup_env(prepared, t0)
+        cleanup(venv, plan, daemon, uv_thread, whl_paths, t0)
 
 
 # ---------------------------------------------------------------------------
@@ -431,48 +433,51 @@ def run_package(
     package: str,
     args: list[str] | None = None,
     extra_packages: list[str] | None = None,
-    cache_dir: str | None = None,
 ) -> None:
-    """Install a package and run its console_script entry point.
-
-    Like uvx but with streaming extraction and progressive loading.
-    The entry point runs in-process so the lazy import hook works.
-    """
+    """Install a package and run its console_script entry point."""
     if args is None:
         args = []
 
-    # Build requirements: target package + any extras
     requirements = [package]
     if extra_packages:
         requirements.extend(extra_packages)
 
-    prepared = prepare_env(requirements, cache_dir=cache_dir)
+    venv, site_packages, plan, daemon, whl_paths, uv_thread = prepare_env(requirements)
 
-    if not prepared.is_cached:
-        # Wait for the target package's metadata to be on disk before
-        # we can discover its entry point.
+    if plan and not (venv / ".complete").exists():
+        # Wait for the target package's metadata to be on disk
         pkg_normalized = re.sub(r"[-_.]+", "-", package.split("[")[0]).lower()
-        in_daemon = any(
-            re.sub(r"[-_.]+", "-", w.distribution).lower() == pkg_normalized
-            for w in prepared.plan.fast_wheels
-        )
 
-        if in_daemon and prepared.daemon:
-            log.info("Waiting for %s metadata (daemon)...", package)
-            prepared.daemon.wait_done(package, timeout_secs=120.0)
-
-        if not in_daemon and prepared.uv_thread:
-            # Target package is in the uv batch — must wait for uv to finish
+        if daemon:
+            # Find the exact distribution name the daemon is tracking
+            daemon_dist = next(
+                (w.distribution for w in plan.fast_wheels
+                 if re.sub(r"[-_.]+", "-", w.distribution).lower() == pkg_normalized),
+                None,
+            )
+            if daemon_dist:
+                log.info("Waiting for %s metadata (daemon)...", daemon_dist)
+                daemon.wait_done(daemon_dist, timeout_secs=120.0)
+            elif uv_thread:
+                log.info("Waiting for %s metadata (uv)...", package)
+                uv_thread.join(timeout=120)
+                uv_thread = None
+        elif uv_thread:
             log.info("Waiting for %s metadata (uv)...", package)
-            prepared.uv_thread.join(timeout=120)
-            prepared.uv_thread = None
+            uv_thread.join(timeout=120)
+            uv_thread = None
 
-    # Discover the console_script entry point
+    # Discover entry point
     try:
-        ep = discover_entry_point(package, prepared.site_packages)
+        ep = discover_entry_point(package, site_packages)
     except EntryPointError as e:
         log.error("%s", e)
         sys.exit(1)
+
+    if not daemon:
+        # Warm path — just run
+        invoke_entry_point(ep, args)
+        return
 
     log.info("Running %s (packages installing in background)...", ep.name)
     t0 = time.monotonic()
@@ -480,7 +485,7 @@ def run_package(
     try:
         invoke_entry_point(ep, args)
     finally:
-        cleanup_env(prepared, t0)
+        cleanup(venv, plan, daemon, uv_thread, whl_paths, t0)
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +496,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="zerostart",
         description="Run Python scripts or packages with progressive loading",
-        usage="zerostart [-p PKG ...] [-r FILE] [--cache-dir DIR] [-v] <target> [args ...]",
+        usage="zerostart [-p PKG ...] [-r FILE] [-v] <target> [args ...]",
     )
     parser.add_argument(
         "target",
@@ -504,7 +509,6 @@ def main() -> None:
     )
     parser.add_argument("-r", "--requirements", help="Requirements file")
     parser.add_argument("-p", "--packages", action="append", help="Additional packages to install (repeatable: -p torch -p numpy)")
-    parser.add_argument("--cache-dir", help="Cache directory (default: .zerostart)")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -515,21 +519,17 @@ def main() -> None:
     )
 
     if _is_script(args.target):
-        # Script mode: pass args through via sys.argv
         sys.argv = [args.target] + args.target_args
         run(
             script=args.target,
             requirements=args.packages,
             requirements_file=args.requirements,
-            cache_dir=args.cache_dir,
         )
     else:
-        # Package mode: target is a package name, args go to its entry point
         run_package(
             package=args.target,
             args=args.target_args,
             extra_packages=args.packages,
-            cache_dir=args.cache_dir,
         )
 
 

@@ -1,8 +1,8 @@
 """Artifact resolution and manifest generation for fast-wheel daemon.
 
-Resolves requirements via `uv pip compile` to get exact wheel URLs,
-classifies them by size, and generates the JSON manifest that the
-Rust daemon reads.
+Resolves requirements via `uv pip compile --format pylock.toml` which gives
+us exact wheel URLs, sizes, and hashes in a single call — no separate PyPI
+lookups needed.
 """
 
 from __future__ import annotations
@@ -13,9 +13,8 @@ import logging
 import platform as platform_mod
 import re
 import subprocess
+import sys
 import tempfile
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,16 +25,15 @@ UV_THRESHOLD = 1 * 1024 * 1024  # 1MB
 
 
 def _detect_arch() -> str:
-    """Detect the machine architecture for wheel selection.
+    """Detect the machine architecture.
 
-    Returns arch string as used in wheel filenames (e.g. 'x86_64', 'aarch64').
+    Returns the raw machine arch (e.g. 'x86_64', 'arm64', 'aarch64').
+    On macOS this is 'arm64'; on Linux it's 'aarch64'.
     """
     machine = platform_mod.machine().lower()
-    # Normalize common aliases
     if machine in ("x86_64", "amd64"):
         return "x86_64"
-    if machine in ("aarch64", "arm64"):
-        return "aarch64"
+    # Don't normalize arm64→aarch64: macOS wheels use 'arm64', Linux uses 'aarch64'
     return machine
 
 
@@ -170,6 +168,9 @@ def resolve_requirements(
 def _uv_platform_tag(platform: str) -> str:
     """Build the --python-platform value for uv pip compile."""
     arch = _detect_arch()
+    # uv expects 'aarch64' not 'arm64' in platform tags
+    if arch == "arm64":
+        arch = "aarch64"
     if platform == "macos":
         return f"{arch}-apple-darwin"
     if platform == "linux":
@@ -241,10 +242,15 @@ def _lookup_pypi_wheel(
         log.warning("PyPI lookup failed for %s==%s: %s", distribution, version, e)
         return None
 
-    # Find the best wheel
-    py_tag = f"cp{python_version.replace('.', '')}"
-    best_url = None
-    best_size = 0
+    # Find the best wheel for this platform
+    # Wheel filename format: {dist}-{ver}(-{build})?-{python}-{abi}-{platform}.whl
+    arch = _detect_arch()
+    py_major_minor = f"cp{python_version.replace('.', '')}"  # e.g. cp314
+    plat_tag = "macosx" if platform == "macos" else "manylinux" if platform == "linux" else platform
+
+    best_platform = None   # platform-specific match (e.g. macosx_arm64)
+    best_universal = None  # none-any match
+    best_fallback = None   # any .whl
 
     for file_info in data.get("urls", []):
         filename = file_info.get("filename", "")
@@ -253,26 +259,31 @@ def _lookup_pypi_wheel(
 
         file_url = file_info["url"]
         file_size = file_info.get("size", 0)
+        entry = (file_url, file_size)
 
-        # Prefer platform-specific wheel matching current arch
-        arch = _detect_arch()
-        plat_tag = "macosx" if platform == "macos" else platform
-        if plat_tag in filename and py_tag in filename and arch in filename:
-            best_url = file_url
-            best_size = file_size
-            break
-        elif "none-any" in filename:
-            if not best_url:
-                best_url = file_url
-                best_size = file_size
+        if "none-any" in filename:
+            if not best_universal:
+                best_universal = entry
+            continue
 
-    if not best_url:
-        # Fallback to first .whl
-        for file_info in data.get("urls", []):
-            if file_info.get("filename", "").endswith(".whl"):
-                best_url = file_info["url"]
-                best_size = file_info.get("size", 0)
-                break
+        # Platform-specific: must match OS and arch
+        # macOS wheels may use 'universal2' instead of 'arm64'
+        arch_match = arch in filename or (platform == "macos" and "universal2" in filename)
+        if plat_tag in filename and arch_match:
+            # Skip free-threaded builds (cp314t) — we need regular cpython (cp314)
+            if f"-{py_major_minor}t-" in filename:
+                continue
+            # Check Python compatibility: cpXXX or py3
+            # Use delimiter-aware matching to avoid "cp311" matching "pypy311"
+            if f"-{py_major_minor}-" in filename or "-py3-" in filename:
+                best_platform = entry
+            # Don't promote wrong-Python wheels (e.g. PyPy) to best_platform
+            continue
+
+        if not best_fallback:
+            best_fallback = entry
+
+    best_url, best_size = best_platform or best_universal or best_fallback or (None, 0)
 
     if not best_url:
         return None

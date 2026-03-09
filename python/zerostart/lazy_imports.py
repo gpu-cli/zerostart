@@ -104,8 +104,17 @@ class LazyImportHook(importlib.abc.MetaPathFinder):
             self._resolved.add(fullname)
             return None
 
-        # Check if daemon knows about this distribution
+        # Check if this import maps to a package we're installing
         dist = self._dist_for_import(top)
+        is_known = dist.lower().replace("-", "_") in {
+            d.lower().replace("-", "_") for d in self._import_map.values()
+        } or top.lower() in {k.lower() for k in self._import_map}
+
+        # Unknown package not in our import map — don't wait, let it fail naturally
+        if not is_known and self._import_map:
+            self._resolved.add(top + ".*")
+            return None
+
         try:
             done = self._daemon.is_done(dist)
         except Exception:
@@ -121,12 +130,7 @@ class LazyImportHook(importlib.abc.MetaPathFinder):
         # Signal demand and wait
         self._daemon.signal_demand(dist)
 
-        # Use short timeout for speculative imports
-        is_known = dist.lower().replace("-", "_") in {
-            d.lower().replace("-", "_") for d in self._import_map.values()
-        } or top.lower() in {k.lower() for k in self._import_map}
-
-        max_wait = self.timeout if is_known or not self._import_map else self.speculative_timeout
+        max_wait = self.timeout
 
         log.info("import %s — waiting for %s... (max %.0fs)", fullname, dist, max_wait)
         start = time.monotonic()
@@ -139,8 +143,11 @@ class LazyImportHook(importlib.abc.MetaPathFinder):
             self._resolved.add(fullname)
             return None
 
-        # Invalidate caches so Python sees the new files
+        # Invalidate ALL import caches so Python sees the new files.
+        # FileFinder caches directory listings — must clear path_importer_cache
+        # entirely so Python creates fresh FileFinder instances.
         importlib.invalidate_caches()
+        sys.path_importer_cache.clear()
 
         elapsed = time.monotonic() - start
         if elapsed > 0.01:
@@ -148,7 +155,8 @@ class LazyImportHook(importlib.abc.MetaPathFinder):
                 self._wait_times[top] = elapsed
             log.info("import %s — ready (%.1fs)", fullname, elapsed)
 
-        self._resolved.add(fullname)
+        # Mark entire package as resolved so submodule imports skip the hook
+        self._resolved.add(top + ".*")
         return None
 
     def report(self) -> dict[str, float]:

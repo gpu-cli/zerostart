@@ -1,0 +1,9 @@
+package,uvx_cold_s,zerostart_cold_s,zerostart_warm_s
+black,6.042,6.408,0.120
+ruff,0.557,1.216,0.077
+isort,0.355,0.314,0.091
+autopep8,0.475,0.344,0.083
+yapf,0.466,0.412,0.089
+pyflakes,0.513,0.286,0.102
+flake8,0.518,0.336,0.111
+pylint,0.694,0.464,0.116

@@ -16,7 +16,9 @@ echo "=== zerostart GPU Test Runner ==="
 echo "Date: $(date)"
 echo "Python: $(python3 --version)"
 echo "GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo 'none')"
-echo "Disk: $(df -h /tmp | tail -1 | awk '{print $4 " free"}') (container), $(df -h /gpu-cli-workspaces | tail -1 | awk '{print $4 " free"}') (volume)"
+DISK_CONTAINER=$(df -h /tmp | tail -1 | awk '{print $4 " free"}')
+DISK_VOLUME=$(df -h /gpu-cli-workspaces 2>/dev/null | tail -1 | awk '{print $4 " free"}' || echo "no volume")
+echo "Disk: $DISK_CONTAINER (container), $DISK_VOLUME (volume)"
 echo ""
 
 # --- Setup ---
@@ -31,11 +33,15 @@ done
 cd /workspace/zerostart 2>/dev/null || cd "$(dirname "$0")/.."
 echo "project root: $(pwd)"
 
-# Use the persistent volume for everything heavy (container disk is only 20GB)
-VOLDIR=/gpu-cli-workspaces/.cache/zerostart-test
+# Use persistent volume if available, else /tmp for ephemeral pods
+if [ -d /gpu-cli-workspaces ]; then
+    VOLDIR=/gpu-cli-workspaces/.cache/zerostart-test
+else
+    VOLDIR=/tmp/zerostart-test
+fi
 mkdir -p "$VOLDIR"
 
-# Create a fresh venv on the volume (the synced .venv has macOS python which breaks maturin)
+# Create a fresh venv (the synced .venv has macOS python which breaks maturin)
 echo "Creating fresh venv..."
 rm -rf "$VOLDIR/venv"
 python3 -m venv "$VOLDIR/venv"
@@ -57,12 +63,11 @@ echo "zerostart installed: $(which zerostart)"
 # Verify imports
 python3 -c "import zerostart; import zs_fast_wheel; print('imports ok')"
 
-# Shared cache dir on the volume — reuse across tests to save disk
-CACHE="$VOLDIR/cache"
-rm -rf "$CACHE"
+# Clean stale caches (may have wrong-arch wheels from previous runs)
+rm -rf .zerostart
 
-# Cleanup helper
-cleanup_cache() { rm -rf "$CACHE"; }
+# Cleanup helper — clear cache between tests for isolation
+cleanup_cache() { rm -rf .zerostart; }
 
 echo ""
 echo "=== 1. Basic Functionality ==="
@@ -75,6 +80,7 @@ import requests
 print(f"requests: {requests.__version__}")
 PYEOF
 echo 'requests' > /tmp/reqs_smoke.txt
+cleanup_cache
 if zerostart -r /tmp/reqs_smoke.txt /tmp/test_smoke.py 2>&1; then
     pass "1.1 smoke test"
 else
@@ -102,6 +108,7 @@ cat > /tmp/test_inline.py << 'PYEOF'
 import yaml
 print(f"yaml: {yaml.__version__}")
 PYEOF
+cleanup_cache
 if zerostart -p pyyaml /tmp/test_inline.py 2>&1; then
     pass "1.3 inline packages"
 else
@@ -130,6 +137,7 @@ echo "--- 1.5 Auto-detect requirements.txt ---"
 mkdir -p /tmp/test_autodetect
 echo 'six' > /tmp/test_autodetect/requirements.txt
 echo 'import six; print(f"six: {six.__version__}")' > /tmp/test_autodetect/app.py
+cleanup_cache
 if (cd /tmp/test_autodetect && zerostart app.py 2>&1); then
     pass "1.5 auto-detect requirements.txt"
 else
@@ -148,6 +156,7 @@ import requests
 import six
 print(f"requests: {requests.__version__}, six: {six.__version__}")
 PYEOF
+cleanup_cache
 if zerostart /tmp/test_pep723.py 2>&1; then
     pass "1.6 PEP 723 inline metadata"
 else
@@ -169,6 +178,7 @@ import numpy as np
 import yaml
 print(f"numpy: {np.__version__}, yaml: {yaml.__version__}")
 PYEOF
+cleanup_cache
 if zerostart /tmp/test_pep723_ver.py 2>&1; then
     pass "1.7 PEP 723 version constraints"
 else
@@ -188,8 +198,10 @@ cat > /tmp/test_pep723_multi.py << 'PYEOF'
 # ///
 
 import requests, click, rich
-print(f"requests: {requests.__version__}, click: {click.__version__}, rich: {rich.__version__}")
+from importlib.metadata import version
+print(f"requests: {requests.__version__}, click: {version('click')}, rich: {version('rich')}")
 PYEOF
+cleanup_cache
 if zerostart /tmp/test_pep723_multi.py 2>&1; then
     pass "1.8 PEP 723 multiline"
 else
@@ -207,6 +219,7 @@ cat > /tmp/test_override.py << 'PYEOF'
 import six
 print(f"six: {six.__version__}")
 PYEOF
+cleanup_cache
 if zerostart -p six /tmp/test_override.py 2>&1; then
     pass "1.9 -p overrides inline"
 else
@@ -221,9 +234,11 @@ echo ""
 echo "--- 2.1 Pure Python packages ---"
 cat > /tmp/test_pure.py << 'PYEOF'
 import requests, click, rich, six, idna, certifi
-print(f"requests={requests.__version__} click={click.__version__} rich={rich.__version__}")
+from importlib.metadata import version
+print(f"requests={requests.__version__} click={version('click')} rich={version('rich')}")
 print(f"six={six.__version__} idna={idna.__version__} certifi={certifi.__version__}")
 PYEOF
+cleanup_cache
 if zerostart -p 'requests' -p 'click' -p 'rich' -p 'six' -p 'idna' -p 'certifi' /tmp/test_pure.py 2>&1; then
     pass "2.1 pure Python packages"
 else
@@ -240,6 +255,7 @@ arr = np.array([1, 2, 3])
 print(f"numpy: {np.__version__}, array: {arr}")
 print(f"orjson: {orjson.__version__}")
 PYEOF
+cleanup_cache
 if zerostart -p numpy -p orjson /tmp/test_compiled.py 2>&1; then
     pass "2.2 compiled extensions"
 else
@@ -260,6 +276,7 @@ if torch.cuda.is_available():
     x = torch.randn(10, device="cuda")
     print(f"GPU tensor: {x.shape} on {x.device}")
 PYEOF
+cleanup_cache
 if zerostart -p torch -p transformers -p safetensors /tmp/test_ml.py 2>&1; then
     pass "2.3 large ML packages"
 else
@@ -278,6 +295,7 @@ import bs4         # from beautifulsoup4
 print(f"yaml={yaml.__version__} PIL=ok sklearn={sklearn.__version__}")
 print(f"dateutil={dateutil.__version__} bs4={bs4.__version__}")
 PYEOF
+cleanup_cache
 if zerostart -p pyyaml -p pillow -p scikit-learn -p python-dateutil -p beautifulsoup4 /tmp/test_names.py 2>&1; then
     pass "2.4 non-obvious import names"
 else
@@ -292,6 +310,7 @@ import boto3
 import botocore
 print(f"boto3: {boto3.__version__}, botocore: {botocore.__version__}")
 PYEOF
+cleanup_cache
 if zerostart -p boto3 /tmp/test_transitive.py 2>&1; then
     pass "2.5 transitive deps"
 else
@@ -313,8 +332,8 @@ assert requests.__version__ == "2.31.0", f"expected requests 2.31.0, got {reques
 print(f"numpy={np.__version__} requests={requests.__version__} — versions correct")
 PYEOF
 echo -e 'numpy==1.26.4\nrequests==2.31.0' > /tmp/reqs_pinned.txt
-rm -rf $VOLDIR/t_pinned
-if zerostart -r /tmp/reqs_pinned.txt --cache-dir $VOLDIR/t_pinned /tmp/test_pinned.py 2>&1; then
+rm -rf .zerostart
+if zerostart -r /tmp/reqs_pinned.txt /tmp/test_pinned.py 2>&1; then
     pass "3.1 pinned versions"
 else
     fail "3.1 pinned versions" "exit $?"
@@ -323,7 +342,7 @@ fi
 # --- 3.2 Version upgrade — cache invalidation ---
 echo ""
 echo "--- 3.2 Version upgrade cache invalidation ---"
-rm -rf $VOLDIR/t_upgrade
+rm -rf .zerostart
 
 # Run 1: numpy 1.26.4
 echo 'numpy==1.26.4' > /tmp/reqs_v1.txt
@@ -332,8 +351,8 @@ import numpy as np
 print(f"v1: numpy={np.__version__}")
 assert np.__version__ == "1.26.4"
 PYEOF
-zerostart -r /tmp/reqs_v1.txt --cache-dir $VOLDIR/t_upgrade /tmp/test_v1.py 2>&1
-ENVS_AFTER_V1=$(ls $VOLDIR/t_upgrade/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_v1.txt /tmp/test_v1.py 2>&1
+ENVS_AFTER_V1=$(ls .zerostart/envs/ 2>/dev/null | wc -l)
 
 # Run 2: numpy 1.26.3 (different version)
 echo 'numpy==1.26.3' > /tmp/reqs_v2.txt
@@ -342,8 +361,8 @@ import numpy as np
 print(f"v2: numpy={np.__version__}")
 assert np.__version__ == "1.26.3"
 PYEOF
-zerostart -r /tmp/reqs_v2.txt --cache-dir $VOLDIR/t_upgrade /tmp/test_v2.py 2>&1
-ENVS_AFTER_V2=$(ls $VOLDIR/t_upgrade/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_v2.txt /tmp/test_v2.py 2>&1
+ENVS_AFTER_V2=$(ls .zerostart/envs/ 2>/dev/null | wc -l)
 
 if [ "$ENVS_AFTER_V2" -gt "$ENVS_AFTER_V1" ]; then
     pass "3.2 version upgrade creates new cache"
@@ -354,20 +373,20 @@ fi
 # --- 3.3 Adding a package ---
 echo ""
 echo "--- 3.3 Adding a package to requirements ---"
-rm -rf $VOLDIR/t_add
+rm -rf .zerostart
 
 echo 'six' > /tmp/reqs_add1.txt
 echo 'import six; print(f"six={six.__version__}")' > /tmp/test_add.py
-zerostart -r /tmp/reqs_add1.txt --cache-dir $VOLDIR/t_add /tmp/test_add.py 2>&1
-ENVS_1=$(ls $VOLDIR/t_add/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_add1.txt /tmp/test_add.py 2>&1
+ENVS_1=$(ls .zerostart/envs/ 2>/dev/null | wc -l)
 
 echo -e 'six\nidna' > /tmp/reqs_add2.txt
 cat > /tmp/test_add2.py << 'PYEOF'
 import six, idna
 print(f"six={six.__version__} idna={idna.__version__}")
 PYEOF
-zerostart -r /tmp/reqs_add2.txt --cache-dir $VOLDIR/t_add /tmp/test_add2.py 2>&1
-ENVS_2=$(ls $VOLDIR/t_add/envs/ 2>/dev/null | wc -l)
+zerostart -r /tmp/reqs_add2.txt /tmp/test_add2.py 2>&1
+ENVS_2=$(ls .zerostart/envs/ 2>/dev/null | wc -l)
 
 if [ "$ENVS_2" -gt "$ENVS_1" ]; then
     pass "3.3 adding package creates new cache"
@@ -378,19 +397,19 @@ fi
 # --- 3.4 Warm cache hit ---
 echo ""
 echo "--- 3.4 Warm cache hit ---"
-rm -rf $VOLDIR/t_warm
+rm -rf .zerostart
 echo 'import six; print(f"six={six.__version__}")' > /tmp/test_warm.py
 echo 'six' > /tmp/reqs_warm.txt
 
 # Cold run
 T0=$(date +%s%N)
-zerostart -r /tmp/reqs_warm.txt --cache-dir $VOLDIR/t_warm /tmp/test_warm.py 2>&1
+zerostart -r /tmp/reqs_warm.txt /tmp/test_warm.py 2>&1
 T1=$(date +%s%N)
 COLD_MS=$(( (T1 - T0) / 1000000 ))
 
 # Warm run
 T0=$(date +%s%N)
-zerostart -r /tmp/reqs_warm.txt --cache-dir $VOLDIR/t_warm /tmp/test_warm.py 2>&1
+zerostart -r /tmp/reqs_warm.txt /tmp/test_warm.py 2>&1
 T1=$(date +%s%N)
 WARM_MS=$(( (T1 - T0) / 1000000 ))
 
@@ -401,8 +420,8 @@ else
     fail "3.4 warm cache" "warm (${WARM_MS}ms) not faster than cold (${COLD_MS}ms)"
 fi
 
-# Clean up version test caches to reclaim disk before heavy tests
-rm -rf $VOLDIR/t_pinned $VOLDIR/t_upgrade $VOLDIR/t_add $VOLDIR/t_warm
+# Clean up caches before heavy tests
+rm -rf .zerostart
 
 echo ""
 echo "=== 4. Progressive Loading ==="
@@ -425,7 +444,7 @@ print(f"numpy import: {t_numpy:.2f}s")
 print(f"torch: {torch.__version__}, cuda: {torch.cuda.is_available()}")
 PYEOF
 cleanup_cache
-if zerostart -p torch -p numpy --cache-dir "$CACHE" /tmp/test_progressive.py 2>&1; then
+if zerostart -p torch -p numpy /tmp/test_progressive.py 2>&1; then
     pass "4.1 progressive loading"
 else
     fail "4.1 progressive loading" "exit $?"
@@ -442,7 +461,7 @@ from torch import Tensor
 print(f"torch={torch.__version__} nn={torch.nn} F={F}")
 PYEOF
 cleanup_cache
-if zerostart -p torch --cache-dir "$CACHE" /tmp/test_submod.py 2>&1; then
+if zerostart -p torch /tmp/test_submod.py 2>&1; then
     pass "4.2 submodule imports"
 else
     fail "4.2 submodule imports" "exit $?"
@@ -466,7 +485,7 @@ assert elapsed < 10, f"speculative import took too long: {elapsed:.1f}s"
 print("speculative timeout ok")
 PYEOF
 cleanup_cache
-if zerostart -p torch --cache-dir "$CACHE" /tmp/test_speculative.py 2>&1; then
+if zerostart -p torch /tmp/test_speculative.py 2>&1; then
     pass "4.3 speculative imports"
 else
     fail "4.3 speculative imports" "exit $?"
@@ -518,7 +537,7 @@ print(result[0]["generated_text"])
 print("HF pipeline ok")
 PYEOF
 cleanup_cache
-if timeout 300 zerostart -p torch -p transformers -p accelerate --cache-dir "$CACHE" /tmp/test_hf.py 2>&1; then
+if timeout 300 zerostart -p torch -p transformers -p accelerate /tmp/test_hf.py 2>&1; then
     pass "6.1 HuggingFace pipeline"
 else
     fail "6.1 HuggingFace pipeline" "exit $?"
@@ -546,7 +565,7 @@ for i in range(10):
 print(f"Training complete. Final loss: {loss.item():.4f}")
 PYEOF
 cleanup_cache
-if zerostart -p torch --cache-dir "$CACHE" /tmp/test_train.py 2>&1; then
+if zerostart -p torch /tmp/test_train.py 2>&1; then
     pass "6.2 training loop"
 else
     fail "6.2 training loop" "exit $?"
@@ -570,7 +589,7 @@ print(f"torch: {torch.__version__}, cuda: {torch.cuda.is_available()}")
 print("FastAPI app created ok")
 PYEOF
 cleanup_cache
-if zerostart -p torch -p fastapi -p uvicorn --cache-dir "$CACHE" /tmp/test_api.py 2>&1; then
+if zerostart -p torch -p fastapi -p uvicorn /tmp/test_api.py 2>&1; then
     pass "6.3 FastAPI + torch"
 else
     fail "6.3 FastAPI + torch" "exit $?"
@@ -587,7 +606,7 @@ print(f"Shape: {df.shape}")
 print(f"Mean A: {df['A'].mean():.4f}")
 PYEOF
 cleanup_cache
-if zerostart -p pandas -p numpy --cache-dir "$CACHE" /tmp/test_data.py 2>&1; then
+if zerostart -p pandas -p numpy /tmp/test_data.py 2>&1; then
     pass "6.4 data processing"
 else
     fail "6.4 data processing" "exit $?"
@@ -618,7 +637,7 @@ print(f"config: {config}")
 print("PEP 723 real-world ok")
 PYEOF
 cleanup_cache
-if zerostart --cache-dir "$CACHE" /tmp/test_pep723_real.py 2>&1; then
+if zerostart /tmp/test_pep723_real.py 2>&1; then
     pass "6.5 PEP 723 real-world"
 else
     fail "6.5 PEP 723 real-world" "exit $?"

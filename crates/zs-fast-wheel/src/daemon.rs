@@ -409,6 +409,7 @@ mod tests {
         WheelSpec {
             url: format!("https://example.com/{name}-1.0.whl"),
             distribution: name.to_string(),
+            version: "1.0".to_string(),
             import_roots: vec![name.to_string()],
             size,
             hash: None,

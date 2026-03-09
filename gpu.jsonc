@@ -15,12 +15,11 @@
     "shell": {
       "steps": [
         { "run": "curl -LsSf https://astral.sh/uv/install.sh | sh" },
-        { "run": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" },
         { "run": "chmod +x bin/*-linux-x86_64" },
-        { "run": "pip install maturin patchelf pytest" }
+        { "run": "pip install pytest" }
       ]
     }
   },
   "keep_alive_minutes": 10,
-  "volume_mode": "global"
+  "volume_mode": "none"
 }

@@ -124,13 +124,18 @@ report = remove_hook()  # returns per-package wait times
 
 ## GPU Testing
 
-Cross-compile locally, test on container GPUs via `gpu run`. Binaries in `bin/` are gitignored and synced to pods via `gpu.jsonc` `include: ["bin/"]`.
+**Always cross-compile locally and test the cross-compiled binaries on GPU pods.** Never build Rust on the pod — it wastes GPU time and ephemeral disk space. The `gpu.jsonc` `include: ["bin/"]` syncs the `bin/` directory to pods automatically.
 
 ```bash
-# Cross-compile locally (don't burn GPU time on compilation)
+# 1. Cross-compile locally (musl = static binary, no glibc dependency)
 cd crates && cargo zigbuild --target x86_64-unknown-linux-musl --release -p zs-fast-wheel
 cp crates/target/x86_64-unknown-linux-musl/release/zs-fast-wheel bin/zs-fast-wheel-linux-x86_64
 
-# Test on a GPU pod
+# 2. Test on a GPU pod (binary is synced via include in gpu.jsonc)
 gpu run "bin/zs-fast-wheel-linux-x86_64 warm --requirements 'torch>=2.0'"
+
+# 3. Run the full test suite
+gpu run "bash tests/gpu_test_runner.sh"
 ```
+
+The test runner should use the pre-built binary from `bin/` rather than running `maturin develop` on the pod. This avoids needing Rust toolchain on the pod and saves ~5min of cold compilation.

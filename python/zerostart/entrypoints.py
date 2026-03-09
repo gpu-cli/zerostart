@@ -233,5 +233,7 @@ def invoke_entry_point(
     log.info("Running entry point: %s (%s:%s)", ep.name, ep.module, ep.attr)
 
     module = importlib.import_module(ep.module)
-    func = getattr(module, ep.attr)
-    func()
+    obj = module
+    for part in ep.attr.split("."):
+        obj = getattr(obj, part)
+    obj()
