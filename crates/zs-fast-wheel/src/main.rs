@@ -146,6 +146,24 @@ fn num_cpus() -> usize {
         .unwrap_or(4)
 }
 
+/// Read a usize env var with a default. Used for tuning knobs.
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// Parallel downloads (default 16). Set ZS_PARALLEL_DOWNLOADS to tune.
+fn configured_parallel_downloads() -> usize {
+    env_usize("ZS_PARALLEL_DOWNLOADS", 16)
+}
+
+/// Extraction threads (default num_cpus * 2). Set ZS_EXTRACT_THREADS to tune.
+fn configured_extract_threads() -> usize {
+    env_usize("ZS_EXTRACT_THREADS", num_cpus() * 2)
+}
+
 /// Compute the environment key (must match Python's _env_key).
 fn env_key(requirements: &[String]) -> String {
     let mut sorted = requirements.to_vec();
@@ -645,12 +663,23 @@ async fn main() -> Result<()> {
             };
 
             if !plan.daemon_wheels.is_empty() {
-                // Check shared cache — restore cached wheels via hardlinks, only download uncached
+                // Check shared cache in parallel — restore cached wheels via hardlinks
+                let sp_for_cache = site_packages.clone();
+                let wheels_for_cache = plan.daemon_wheels.clone();
+                let cache_results: Vec<bool> = tokio::task::spawn_blocking(move || {
+                    use rayon::prelude::*;
+                    wheels_for_cache
+                        .par_iter()
+                        .map(|spec| restore_from_shared_cache(spec, &sp_for_cache))
+                        .collect()
+                })
+                .await?;
+
                 let mut uncached_wheels = Vec::new();
                 let mut cached_count = 0u32;
 
-                for spec in &plan.daemon_wheels {
-                    if restore_from_shared_cache(spec, &site_packages) {
+                for (spec, was_cached) in plan.daemon_wheels.iter().zip(cache_results.iter()) {
+                    if *was_cached {
                         cached_count += 1;
                         if verbose {
                             eprintln!("  {} (shared cache hit)", spec.distribution);
@@ -676,10 +705,15 @@ async fn main() -> Result<()> {
                 }
 
                 if !uncached_wheels.is_empty() {
+                    let pd = configured_parallel_downloads();
+                    let et = configured_extract_threads();
+                    if verbose {
+                        eprintln!("Config: parallel_downloads={pd}, extract_threads={et}");
+                    }
                     let config = DaemonConfig {
                         site_packages: site_packages.clone(),
-                        parallel_downloads: 8,
-                        extract_threads: num_cpus(),
+                        parallel_downloads: pd,
+                        extract_threads: et,
                     };
 
                     let wheels_to_cache: Vec<WheelSpec> = uncached_wheels.clone();

@@ -36,13 +36,21 @@ const CD_SIGNATURE: u32 = 0x02014b50;
 /// Large file threshold — entries above this get their own Range request
 const LARGE_THRESHOLD: u64 = 1024 * 1024; // 1MB
 
-/// Target chunk size for batching small files into single Range requests
-const CHUNK_TARGET_BYTES: u64 = 8 * 1024 * 1024; // 8MB chunks
+/// Target chunk size for batching small files into single Range requests.
+/// Override with ZS_CHUNK_MB env var (default 16MB).
+fn chunk_target_bytes() -> u64 {
+    std::env::var("ZS_CHUNK_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(16)
+        * 1024
+        * 1024
+}
 
 /// Stream-extract a wheel from a URL with overlapped download+decompress:
 /// 1. Range request the central directory (small, fast)
 /// 2. Parse entries to get file offsets and sizes
-/// 3. Group small files into contiguous chunks (~8MB each)
+/// 3. Group small files into contiguous chunks (ZS_CHUNK_MB, default 16MB)
 /// 4. Large files get individual Range requests
 /// 5. Download chunks in parallel, extract files from each chunk as it arrives
 pub async fn stream_extract_wheel(
@@ -151,7 +159,7 @@ pub async fn stream_extract_wheel(
 
 /// Group entries into chunks for efficient Range requests.
 /// Large files (>1MB) get their own chunk. Small files are batched
-/// into contiguous byte ranges up to CHUNK_TARGET_BYTES.
+/// into contiguous byte ranges up to chunk_target_bytes().
 fn build_chunks(entries: &[ZipEntry], total_size: u64) -> Vec<Chunk> {
     // Sort by file offset (entries are usually already sorted, but be safe)
     let mut sorted: Vec<&ZipEntry> = entries.iter().collect();
@@ -195,7 +203,7 @@ fn build_chunks(entries: &[ZipEntry], total_size: u64) -> Vec<Chunk> {
             current_end = entry_end;
             current_entries.push(entry.clone());
         } else if entry_start <= current_end + 4096
-            && (entry_end - current_start) < CHUNK_TARGET_BYTES
+            && (entry_end - current_start) < chunk_target_bytes()
         {
             // Contiguous and within chunk size — add to batch
             current_end = current_end.max(entry_end);
