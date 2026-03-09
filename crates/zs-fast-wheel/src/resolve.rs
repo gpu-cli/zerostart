@@ -146,22 +146,33 @@ fn parse_pylock(content: &str) -> Result<Vec<WheelSpec>> {
             .to_string();
 
         // Get wheels array — pick the best one
-        let wheels = match pkg.get("wheels").and_then(|w| w.as_array()) {
-            Some(w) => w,
-            None => continue, // sdist-only, skip
-        };
+        let wheels = pkg.get("wheels").and_then(|w| w.as_array());
 
-        if let Some((url, size, hash)) = pick_best_wheel(wheels) {
-            let import_roots = guess_import_roots(&name);
-            specs.push(WheelSpec {
-                url,
-                distribution: name,
-                version,
-                import_roots,
-                size,
-                hash,
-            });
+        if let Some(wheels) = wheels {
+            if let Some((url, size, hash)) = pick_best_wheel(wheels) {
+                let import_roots = guess_import_roots(&name);
+                specs.push(WheelSpec {
+                    url,
+                    distribution: name,
+                    version,
+                    import_roots,
+                    size,
+                    hash,
+                });
+                continue;
+            }
         }
+
+        // sdist-only or no matching wheel — include with empty URL so uv handles it
+        let import_roots = guess_import_roots(&name);
+        specs.push(WheelSpec {
+            url: String::new(),
+            distribution: name,
+            version,
+            import_roots,
+            size: 0, // forces into uv_specs bucket (< DAEMON_THRESHOLD)
+            hash: None,
+        });
     }
 
     Ok(specs)
