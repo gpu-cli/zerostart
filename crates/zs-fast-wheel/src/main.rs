@@ -138,6 +138,20 @@ enum Command {
         #[arg(short = 'x', long, default_value_t = num_cpus())]
         extract_threads: usize,
     },
+
+    /// Manage the zerostart cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Show cache size and location
+    Info,
+    /// Remove all cached data (environments, shared wheels, resolution cache)
+    Clean,
 }
 
 fn num_cpus() -> usize {
@@ -462,46 +476,143 @@ fn restore_from_shared_cache(spec: &WheelSpec, site_packages: &Path) -> bool {
 
 /// Populate the shared cache from a freshly extracted wheel in site-packages.
 ///
-/// We identify the wheel's files by looking for its .dist-info directory,
-/// then copy the top-level dirs that belong to it into the cache.
+/// Uses the RECORD file from dist-info to get the exact list of installed files.
+/// Falls back to heuristic matching if RECORD is missing.
 fn populate_shared_cache(spec: &WheelSpec, site_packages: &Path) {
     let cache_path = shared_wheel_cache_dir(spec);
     if cache_path.join(".complete").exists() {
         return; // already cached
     }
 
-    if std::fs::create_dir_all(&cache_path).is_err() {
+    // Use a staging dir for atomic population
+    let staging = cache_path.with_extension("staging");
+    let _ = std::fs::remove_dir_all(&staging); // clean stale staging
+    if std::fs::create_dir_all(&staging).is_err() {
         return;
     }
 
-    // Find this wheel's dist-info and import roots in site-packages
+    // Find dist-info directory for this package
     let norm = spec.distribution.replace('-', "_").to_lowercase();
+    let dist_info = find_dist_info(site_packages, &norm);
+
+    // Try RECORD-based populate first (ground truth)
+    let populated = if let Some(ref di) = dist_info {
+        populate_from_record(site_packages, di, &staging)
+    } else {
+        false
+    };
+
+    // Fallback: copy dist-info + known import roots
+    if !populated {
+        populate_heuristic(site_packages, &norm, &spec.import_roots, &staging);
+    }
+
+    // Atomic commit: rename staging → final
+    if let Ok(()) = std::fs::create_dir_all(cache_path.parent().unwrap_or(Path::new("."))) {
+        let _ = std::fs::rename(&staging, &cache_path);
+        let _ = std::fs::File::create(cache_path.join(".complete"));
+    } else {
+        let _ = std::fs::remove_dir_all(&staging);
+    }
+}
+
+/// Find the dist-info directory for a package in site-packages.
+fn find_dist_info(site_packages: &Path, norm_name: &str) -> Option<std::path::PathBuf> {
+    let entries = std::fs::read_dir(site_packages).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().to_string();
+        if name_str.ends_with(".dist-info") {
+            let stem = name_str.trim_end_matches(".dist-info");
+            let pkg = stem.split('-').next().unwrap_or(stem);
+            if pkg.replace('-', "_").to_lowercase() == *norm_name {
+                return Some(entry.path());
+            }
+        }
+    }
+    None
+}
+
+/// Populate cache from RECORD file — lists every file the wheel installed.
+///
+/// RECORD format: `path,hash,size` per line. Paths are relative to site-packages.
+/// Returns true if RECORD was found and files were copied.
+fn populate_from_record(site_packages: &Path, dist_info: &Path, staging: &Path) -> bool {
+    let record_path = dist_info.join("RECORD");
+    let content = match std::fs::read_to_string(&record_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    // Collect unique top-level dirs/files from RECORD
+    let mut top_level_entries: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for line in content.lines() {
+        let path = line.split(',').next().unwrap_or("").trim();
+        if path.is_empty() {
+            continue;
+        }
+        // Top-level entry is the first path component
+        if let Some(top) = path.split('/').next() {
+            top_level_entries.insert(top.to_string());
+        }
+    }
+
+    if top_level_entries.is_empty() {
+        return false;
+    }
+
+    let mut copied_any = false;
+    for entry_name in &top_level_entries {
+        let src = site_packages.join(entry_name);
+        let dst = staging.join(entry_name);
+        if src.is_dir() {
+            if copy_dir_recursive(&src, &dst).is_ok() {
+                copied_any = true;
+            }
+        } else if src.is_file() {
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::copy(&src, &dst).is_ok() {
+                copied_any = true;
+            }
+        }
+    }
+
+    copied_any
+}
+
+/// Fallback: populate cache using heuristic name matching (dist-info + import roots).
+fn populate_heuristic(
+    site_packages: &Path,
+    norm_name: &str,
+    import_roots: &[String],
+    staging: &Path,
+) {
     if let Ok(entries) = std::fs::read_dir(site_packages) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = name.to_string_lossy().to_string();
 
-            // Match dist-info dir or import root dirs
             let is_dist_info = name_str.ends_with(".dist-info") && {
                 let stem = name_str.trim_end_matches(".dist-info");
                 let pkg = stem.split('-').next().unwrap_or(stem);
-                pkg.replace('-', "_").to_lowercase() == norm
+                pkg.replace('-', "_").to_lowercase() == *norm_name
             };
 
             let is_data_dir = name_str.ends_with(".data") && {
                 let stem = name_str.trim_end_matches(".data");
                 let pkg = stem.split('-').next().unwrap_or(stem);
-                pkg.replace('-', "_").to_lowercase() == norm
+                pkg.replace('-', "_").to_lowercase() == *norm_name
             };
 
-            let is_import_root = spec
-                .import_roots
+            let is_import_root = import_roots
                 .iter()
-                .any(|r| r == &name_str || name_str == format!("{norm}.py"));
+                .any(|r| r == &name_str || name_str == format!("{norm_name}.py"));
 
             if is_dist_info || is_data_dir || is_import_root {
                 let src = entry.path();
-                let dst = cache_path.join(&name);
+                let dst = staging.join(&name);
                 if src.is_dir() {
                     let _ = copy_dir_recursive(&src, &dst);
                 } else {
@@ -510,9 +621,6 @@ fn populate_shared_cache(spec: &WheelSpec, site_packages: &Path) {
             }
         }
     }
-
-    // Mark cache as complete
-    let _ = std::fs::File::create(cache_path.join(".complete"));
 }
 
 /// Recursively hardlink all files from src tree into dst.
@@ -533,9 +641,14 @@ fn hardlink_tree(src: &Path, dst: &Path) -> Result<()> {
         if src_path.is_dir() {
             std::fs::create_dir_all(&dst_path)?;
             hardlink_tree(&src_path, &dst_path)?;
-        } else {
+        } else if !dst_path.exists() {
             // Try hardlink first, fall back to copy (cross-device)
-            if std::fs::hard_link(&src_path, &dst_path).is_err() {
+            if let Err(e) = std::fs::hard_link(&src_path, &dst_path) {
+                tracing::debug!(
+                    "Hardlink failed ({}), falling back to copy: {}",
+                    e,
+                    src_path.display()
+                );
                 std::fs::copy(&src_path, &dst_path)?;
             }
         }
@@ -841,8 +954,83 @@ async fn main() -> Result<()> {
                 eprintln!("  {} ({:.1} MB)", w.distribution, w.size as f64 / 1024.0 / 1024.0);
             }
 
-            run_engine(wheels, site_packages, parallel_downloads, extract_threads).await
+            run_engine(wheels.clone(), site_packages.clone(), parallel_downloads, extract_threads).await?;
+
+            // Populate shared cache for future environments
+            eprintln!("Populating shared cache...");
+            for spec in &wheels {
+                populate_shared_cache(spec, &site_packages);
+            }
+            eprintln!("Shared cache populated ({} wheels)", wheels.len());
+
+            Ok(())
         }
+
+        Command::Cache { action } => {
+            let base = cache_dir();
+            match action {
+                CacheAction::Info => {
+                    let envs = dir_size(&base.join("envs"));
+                    let shared = dir_size(&base.join("shared_wheels"));
+                    let pylock = dir_size(&base.join("pylock"));
+                    let total = envs + shared + pylock;
+
+                    eprintln!("Cache directory: {}", base.display());
+                    eprintln!("  Environments:    {}", human_size(envs));
+                    eprintln!("  Shared wheels:   {}", human_size(shared));
+                    eprintln!("  Resolution:      {}", human_size(pylock));
+                    eprintln!("  Total:           {}", human_size(total));
+                    Ok(())
+                }
+                CacheAction::Clean => {
+                    let size = dir_size(&base);
+                    if base.exists() {
+                        std::fs::remove_dir_all(&base)
+                            .context("failed to remove cache directory")?;
+                        eprintln!("Removed {} ({})", base.display(), human_size(size));
+                    } else {
+                        eprintln!("Cache directory does not exist: {}", base.display());
+                    }
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+/// Recursively compute directory size in bytes.
+fn dir_size(path: &Path) -> u64 {
+    if !path.exists() {
+        return 0;
+    }
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let ft = entry.file_type().unwrap_or_else(|_| {
+                std::fs::symlink_metadata(entry.path())
+                    .map(|m| m.file_type())
+                    .unwrap_or_else(|_| entry.file_type().unwrap())
+            });
+            if ft.is_dir() {
+                total += dir_size(&entry.path());
+            } else {
+                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+    }
+    total
+}
+
+/// Format bytes as human-readable size.
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.1} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
+    } else if bytes >= 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{bytes} B")
     }
 }
 

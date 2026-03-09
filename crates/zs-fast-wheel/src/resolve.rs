@@ -104,6 +104,8 @@ pub struct ResolvedPlan {
 /// Resolve requirements text to a plan with URLs, sizes, and hashes.
 ///
 /// Uses `uv pip compile --format pylock.toml` which gives everything in one call.
+/// Caches the raw pylock output at `$ZEROSTART_CACHE/pylock/{hash}.toml` so
+/// repeat cold starts with the same requirements skip resolution entirely.
 pub fn resolve_requirements(
     requirements: &[String],
     python_version: &str,
@@ -117,7 +119,7 @@ pub fn resolve_requirements(
         });
     }
 
-    let mut specs = uv_resolve_pylock(requirements, python_version, platform)?;
+    let mut specs = resolve_with_cache(requirements, python_version, platform)?;
 
     // For sdist-only packages (url is empty), try PyPI JSON fallback.
     // This catches packages like vllm that have abi3 wheels pylock misses.
@@ -179,14 +181,67 @@ pub fn parse_pyproject_dependencies(content: &str) -> Result<Vec<String>> {
     Ok(deps)
 }
 
-/// Run `uv pip compile --format pylock.toml` and parse the result.
+/// Resolve with caching: check `$ZEROSTART_CACHE/pylock/{hash}.toml` first.
 ///
-/// Returns WheelSpecs with URLs, sizes, and hashes — no PyPI lookups needed.
-fn uv_resolve_pylock(
+/// Cache key includes requirements + python_version + platform so different
+/// targets don't collide. Caches the raw pylock.toml output from uv.
+fn resolve_with_cache(
     requirements: &[String],
     python_version: &str,
     platform: &str,
 ) -> Result<Vec<WheelSpec>> {
+    use sha2::{Digest, Sha256};
+
+    let mut sorted = requirements.to_vec();
+    sorted.sort();
+    let cache_input = format!("{sorted:?}|{python_version}|{platform}");
+    let hash = hex::encode(Sha256::digest(cache_input.as_bytes()));
+    let cache_key = &hash[..16];
+
+    let cache_dir = pylock_cache_dir();
+    let cache_path = cache_dir.join(format!("{cache_key}.toml"));
+
+    // Try cached pylock
+    if let Ok(content) = std::fs::read_to_string(&cache_path) {
+        tracing::info!("Resolution cache hit: {}", cache_path.display());
+        return parse_pylock(&content);
+    }
+
+    // Cache miss — resolve via uv, get raw pylock output
+    let raw_pylock = uv_resolve_pylock_raw(requirements, python_version, platform)?;
+    let specs = parse_pylock(&raw_pylock)?;
+
+    // Cache the raw pylock output (best-effort)
+    if std::fs::create_dir_all(&cache_dir).is_ok() {
+        let _ = std::fs::write(&cache_path, &raw_pylock);
+        tracing::info!("Resolution cached: {}", cache_path.display());
+    }
+
+    Ok(specs)
+}
+
+/// Directory for cached pylock.toml resolution outputs.
+fn pylock_cache_dir() -> std::path::PathBuf {
+    let base = if let Ok(dir) = std::env::var("ZEROSTART_CACHE") {
+        std::path::PathBuf::from(dir)
+    } else {
+        std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .join(".cache")
+            .join("zerostart")
+    };
+    base.join("pylock")
+}
+
+/// Run `uv pip compile --format pylock.toml` and return the raw output.
+///
+/// Returns the raw pylock.toml string for caching. Caller parses it.
+fn uv_resolve_pylock_raw(
+    requirements: &[String],
+    python_version: &str,
+    platform: &str,
+) -> Result<String> {
     // Write requirements to temp file
     let mut tmp = tempfile::NamedTempFile::new().context("failed to create temp file")?;
     for req in requirements {
@@ -217,8 +272,7 @@ fn uv_resolve_pylock(
         anyhow::bail!("uv pip compile failed: {}", &stderr[..stderr.len().min(500)]);
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_pylock(&stdout)
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 /// Parse a pylock.toml string into WheelSpecs.
