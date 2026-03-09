@@ -1,68 +1,97 @@
 # zerostart
 
-**Fast cold starts for GPU Python.** Install packages 6-9x faster than pip/uv and start importing before the install finishes.
+**Fast cold starts for GPU Python.** Drop-in replacement for `uvx` that's 10-12x faster on cold starts and 10-30x faster on warm starts.
 
 ```bash
-# Install and run — packages load progressively as your app starts
-uvx zerostart serve.py
+# Instead of: uvx --from torch python serve.py
+zerostart run -p torch serve.py
 ```
 
 No code changes. No platform lock-in. Works on any container GPU provider.
 
-## The Problem
+## Benchmarks
 
-Every GPU Python cold start wastes minutes on package installation:
+Measured on RTX 4090 pods (RunPod). Both tools download the same wheels from PyPI — zerostart is faster because of *how* it downloads.
 
-| Step | Time |
-|------|------|
-| `pip install torch` (download + extract 800MB wheel) | 60-180s |
-| `pip install transformers tokenizers safetensors ...` | 30-60s |
-| Module imports (`import torch` loads 80+ .so files) | 5-15s |
-| **Total before your code runs** | **~2-5 min** |
+### Cold Start (first run, empty cache)
 
-On container GPU providers (RunPod, Vast.ai, Lambda), you pay for GPU time during this entire wait.
+| Workload | Packages | Size | zerostart | uvx | Speedup |
+|----------|----------|------|-----------|-----|---------|
+| torch + CUDA | 27 wheels | 6.8 GB | **47.9s** | 512.2s | **10.7x** |
+| vllm (full LLM stack) | 177 wheels | 9.4 GB | **69.6s** | 862.1s | **12.4x** |
+| transformers + torch | 51 wheels | 7.0 GB | **45.4s** | — | — |
+| diffusers + torch | 60 wheels | 7.0 GB | **50.4s** | — | — |
+| triton | 1 wheel | 638 MB | **7.0s** | — | — |
 
-## How It Works
+### Warm Start (cached environment)
 
-zerostart does two things:
+| Workload | zerostart | uvx | Speedup |
+|----------|-----------|-----|---------|
+| torch | **2.5s** | 25.5s | **10.2x** |
+| vllm | **3.6s** | 114.0s | **31.7x** |
+| transformers + torch | **3.9s** | — | — |
+| diffusers + torch | **5.3s** | — | — |
+| triton | **0.9s** | — | — |
 
-1. **Fast parallel install** — downloads and extracts wheels simultaneously across 8 connections, streaming large wheels directly to site-packages with no temp files
-2. **Progressive loading** — your app starts immediately; `import torch` blocks only until torch is extracted, not until everything is done
+On a faster pod (1Gbps+ network), cold starts drop further:
+
+| Workload | zerostart | uvx | Speedup |
+|----------|-----------|-----|---------|
+| torch | **23.1s** | 90.9s | **3.9x** |
+| vllm | **33.3s** | 138.1s | **4.1x** |
+
+## Why Is It Faster?
+
+### Cold starts: parallel Range-request streaming
+
+uvx downloads each wheel as a single HTTP connection. A 873MB torch wheel = one TCP stream.
+
+zerostart uses **HTTP Range requests** to download multiple chunks of each wheel in parallel, and starts extracting files while chunks are still arriving:
 
 ```
-┌─ Your Python app ──────────────────────────────────┐
-│                                                     │
-│  import torch        # blocks 1.3s (873MB wheel)    │
-│  import transformers # blocks 0s (already done)     │
-│  model = load(...)   # runs while deps still land   │
-│                                                     │
-│  ┌─ zs-fast-wheel (Rust, in-process) ────────────┐  │
-│  │  downloading:  ████████░░ tokenizers           │  │
-│  │  extracting:   ██████████ torch ✓              │  │
-│  │  queued:       safetensors, triton, ...        │  │
-│  └────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
+uvx (sequential per wheel):
+  torch.whl  [=========downloading=========>] then [==extracting==]
+  numpy.whl  [=====>] then [=]
+
+zerostart (parallel chunks, overlapped extraction):
+  torch.whl  chunk1 [====>]──extract──►
+             chunk2 [====>]──extract──►     ← 4 concurrent Range requests
+             chunk3 [====>]──extract──►       per large wheel
+             chunk4 [====>]──extract──►
+  numpy.whl  [=>]──extract──►               ← all wheels in parallel
 ```
 
-When your code hits `import torch`, the daemon reprioritizes torch to the front of the queue. Your app runs in parallel with the install — not after it.
+On a slow network, this is the difference between 1 connection at 15 MB/s (60s for torch) and 16+ connections saturating the link.
+
+### Warm starts: Rust cache check vs full re-resolve
+
+uvx re-resolves dependencies and rebuilds the tool environment on every invocation — even when packages are cached. For vllm (177 packages), that means 177 cache lookups + metadata checks + links.
+
+zerostart's warm path is three operations in Rust:
+1. `stat(".complete")` — does the cached environment exist?
+2. `find("lib/python*/site-packages")` — locate it
+3. `exec(python)` — run directly
+
+No resolution, no environment setup, no uv involved.
+
+### Shared CUDA layer cache
+
+CUDA libraries (nvidia-cublas, nvidia-cudnn, nvidia-nccl, etc.) are ~6GB and identical across torch, vllm, and diffusers environments. zerostart caches extracted wheels at `$ZEROSTART_CACHE/shared_wheels/` and hardlinks them into new environments — so the second torch-based environment skips downloading those 6GB entirely.
 
 ## Quick Start
 
 ```bash
-# Run any Python script with progressive loading
-uvx zerostart serve.py
+# Run a package (like uvx)
+zerostart run torch -- -c "import torch; print(torch.cuda.is_available())"
 
-# PEP 723 inline deps — just works (reads from script header)
-uvx zerostart serve.py
+# Run a script with dependencies
+zerostart run -p torch -p transformers serve.py
 
-# With explicit requirements
-uvx zerostart -r requirements.txt serve.py
-
-# With inline packages
-uvx zerostart -p torch transformers serve.py
+# With a requirements file
+zerostart run -r requirements.txt serve.py
 
 # Pass args to your script
-uvx zerostart serve.py --port 8000
+zerostart run serve.py -- --port 8000
 ```
 
 ### PEP 723 Inline Script Metadata
@@ -82,101 +111,62 @@ print(f"Loaded on {model.device}")
 ```
 
 ```bash
-uvx zerostart serve.py  # deps auto-detected from script
+zerostart run serve.py  # deps auto-detected from script
 ```
 
-Or install it:
+## Architecture
 
-```bash
-pip install zerostart
-zerostart serve.py
-```
-
-## Benchmarks
-
-Measured on an RTX 4090 pod (RunPod), comparing `uv pip install` against `zs-fast-wheel`:
-
-### Install Speed
-
-| Workload | Packages | Size | uv pip install | zs-fast-wheel | Speedup |
-|----------|----------|------|---------------|---------------|---------|
-| Small (requests, six, etc.) | 6 wheels | 3 MB | 767ms | 775ms | 1.0x |
-| Medium (numpy, pandas, scikit-learn) | 19 wheels | 251 MB | 12.0s | 1.3s | **9.3x** |
-| ML (torch, transformers, triton + CUDA) | 56 wheels | 7 GB | 97.8s | 16.2s | **6.0x** |
-
-For small packages there's no difference. For real ML stacks (hundreds of MB to GB), zs-fast-wheel is **6-9x faster** because it streams and extracts in parallel instead of download-then-extract.
-
-### Time to First Import
-
-With progressive loading, your code doesn't wait for the full install:
-
-| Package | Size | Time to first import |
-|---------|------|---------------------|
-| numpy | 16 MB | 0.2s |
-| torch | 873 MB | 1.3s (demand-prioritized) |
-| safetensors | 0.5 MB | 5.2s (queued behind large wheels) |
-
-`import torch` completes in **1.3 seconds** even though the full 7GB ML stack takes 16s to install.
-
-## How It Works (Details)
-
-1. **Parallel streaming** — downloads and extracts wheels simultaneously across 8 connections
-2. **Demand signaling** — when Python hits `import torch`, the daemon reprioritizes torch to the front of the queue
-3. **Streaming extraction** — large wheels (>50MB) start extracting before the full download completes
-4. **No temp files** — wheels extract directly to site-packages, no intermediate copies
-5. **Lazy import hook** — a `sys.meta_path` finder that gates imports until the package is on disk, then lets normal Python machinery do the loading
-
-### Architecture
-
-The core is `zs-fast-wheel`, a Rust binary + PyO3 module:
+The entire cold path runs in Rust — no Python orchestrator:
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Python process                                 │
-│                                                 │
-│  import torch  ──► lazy import hook             │
-│                     │                           │
-│                     ├─ signal_demand("torch")   │
-│                     └─ wait_done("torch")       │
-│                          │                      │
-│  ┌───────────────────────┼────────────────────┐ │
-│  │  DaemonEngine (Rust, in-process via PyO3)  │ │
-│  │                       │                    │ │
-│  │  ┌─── download ───┐   │   ┌── extract ──┐ │ │
-│  │  │ wheel 1  ████░░ │──┼──►│ site-pkgs/  │ │ │
-│  │  │ wheel 2  ██████ │  │   │ ✓ done      │ │ │
-│  │  │ torch    ░░░░░░ │◄─┘   │ ...         │ │ │
-│  │  │  (reprioritized) │     └─────────────┘ │ │
-│  │  └─────────────────┘                      │ │
-│  └───────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────┘
+zerostart run -p torch serve.py
+
+  1. Find Python          (uv python find || which python3)
+  2. Check warm cache     (stat .complete marker — instant)
+  3. Resolve deps         (uv pip compile --format pylock.toml)
+  4. Check shared cache   (hardlink cached CUDA libs — parallel via rayon)
+  5. Stream wheels        (parallel Range-request download + extract)
+  6. exec(python)         (replaces process, no overhead)
 ```
 
 Key design decisions:
 
-- **In-process via PyO3** — no subprocess, no IPC, no sockets. The Rust engine runs as a native Python extension. `signal_demand()` and `wait_done()` are direct function calls.
-- **`std::sync` for cross-runtime safety** — uses `Mutex` + `Condvar` (not tokio sync) so `wait_done()` works correctly across threads.
-- **Atomic extraction** — each wheel extracts to a staging directory, then atomically renames into site-packages. Partial extractions never corrupt the target.
+- **All wheels through the streaming daemon** — every package with a wheel URL goes through parallel download+extract. Only sdist-only packages (rare) fall back to `uv pip install`.
+- **Atomic extraction** — each wheel extracts to a staging directory, then renames into site-packages. Partial extractions never corrupt the target.
+- **No venv overhead** — uses a flat site-packages directory with a content-addressed cache key. No `uv venv` on the critical path.
+- **Demand-driven scheduling** — when Python hits `import torch`, the daemon reprioritizes torch to the front of the download queue.
 
-## Environment Caching
+## Tuning
 
-zerostart caches completed environments in `.zerostart/`. If the same requirements are resolved again, it reuses the cached environment (~0s install). The cache key is a hash of the resolved artifact set.
+Performance knobs via environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ZS_PARALLEL_DOWNLOADS` | 16 | Concurrent HTTP connections |
+| `ZS_EXTRACT_THREADS` | num_cpus * 2 | Parallel extraction threads |
+| `ZS_CHUNK_MB` | 16 | Streaming chunk size (MB) for Range requests |
+| `ZEROSTART_CACHE` | `~/.cache/zerostart` | Cache directory |
+
+```bash
+# Crank up parallelism on a fast network
+ZS_PARALLEL_DOWNLOADS=32 ZS_CHUNK_MB=32 zerostart run -v -p torch test.py
+```
 
 ## Requirements
 
-- Python 3.10+
 - Linux (container GPU providers: RunPod, Vast.ai, Lambda, etc.)
 - `uv` for requirement resolution (pre-installed on most GPU containers)
+- Python 3.10+
 
-On macOS: zerostart runs your script directly without progressive loading (useful for development).
+macOS works for development (same CLI, no streaming optimization).
 
 ## gpu-cli Integration
 
 If you use [gpu-cli](https://gpu-cli.sh):
 
 ```bash
-# Your script runs with progressive loading on a GPU pod
-gpu run "uvx zerostart serve.py"
+# Your script runs on a GPU pod with fast package loading
+gpu run "zerostart run -p torch serve.py"
 ```
 
 ## License
