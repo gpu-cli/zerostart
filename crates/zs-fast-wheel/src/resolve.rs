@@ -9,6 +9,85 @@ use std::process::Command;
 
 use crate::manifest::WheelSpec;
 
+/// Fallback: look up a wheel URL from PyPI JSON API for sdist-only packages.
+///
+/// Some packages (e.g. vllm with cp38-abi3 wheels) have wheels that
+/// `uv pip compile --format pylock.toml` misses. This is a targeted
+/// fallback — only called for packages without wheels in pylock output.
+fn lookup_pypi_wheel(
+    name: &str,
+    version: &str,
+    python_version: &str,
+    platform: &str,
+) -> Option<(String, u64)> {
+    let url = format!("https://pypi.org/pypi/{name}/{version}/json");
+    let resp = reqwest::blocking::get(&url).ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data: serde_json::Value = resp.json().ok()?;
+
+    let arch = detect_arch();
+    let py_major_minor = format!("cp{}", python_version.replace('.', ""));
+    let plat_tag = if platform.contains("linux") {
+        "manylinux"
+    } else if platform.contains("macos") || platform.contains("darwin") {
+        "macosx"
+    } else {
+        platform
+    };
+
+    let mut best_abi3: Option<(String, u64)> = None;
+    let mut best_specific: Option<(String, u64)> = None;
+    let mut best_universal: Option<(String, u64)> = None;
+
+    for file_info in data.get("urls")?.as_array()? {
+        let filename = file_info.get("filename")?.as_str()?;
+        if !filename.ends_with(".whl") {
+            continue;
+        }
+
+        let file_url = file_info.get("url")?.as_str()?.to_string();
+        let file_size = file_info
+            .get("size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        if filename.contains("none-any") {
+            if best_universal.is_none() {
+                best_universal = Some((file_url, file_size));
+            }
+            continue;
+        }
+
+        // Must match platform + arch
+        let arch_match = filename.contains(arch)
+            || (platform.contains("macos") && filename.contains("universal2"));
+        if !filename.contains(plat_tag) || !arch_match {
+            continue;
+        }
+
+        // abi3 wheels are compatible with any Python >= the tag
+        if filename.contains("-abi3-") {
+            if best_abi3.is_none() {
+                best_abi3 = Some((file_url, file_size));
+            }
+            continue;
+        }
+
+        // Python-version-specific
+        if filename.contains(&format!("-{py_major_minor}-"))
+            || filename.contains("-py3-")
+        {
+            if best_specific.is_none() {
+                best_specific = Some((file_url, file_size));
+            }
+        }
+    }
+
+    best_specific.or(best_abi3).or(best_universal)
+}
+
 /// Size threshold: wheels larger than this go through the streaming daemon.
 /// Smaller wheels are installed via `uv pip install` (instant from cache).
 const DAEMON_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MB
@@ -39,16 +118,35 @@ pub fn resolve_requirements(
         });
     }
 
-    let specs = uv_resolve_pylock(requirements, python_version, platform)?;
+    let mut specs = uv_resolve_pylock(requirements, python_version, platform)?;
+
+    // For sdist-only packages (url is empty), try PyPI JSON fallback.
+    // This catches packages like vllm that have abi3 wheels pylock misses.
+    for spec in &mut specs {
+        if spec.url.is_empty() && !spec.version.is_empty() {
+            if let Some((url, size)) =
+                lookup_pypi_wheel(&spec.distribution, &spec.version, python_version, platform)
+            {
+                tracing::info!(
+                    "PyPI fallback found wheel for {}=={} ({:.1} MB)",
+                    spec.distribution,
+                    spec.version,
+                    size as f64 / 1024.0 / 1024.0
+                );
+                spec.url = url;
+                spec.size = size;
+            }
+        }
+    }
 
     let mut uv_specs = Vec::new();
     let mut daemon_wheels = Vec::new();
 
     for spec in &specs {
-        if spec.size > DAEMON_THRESHOLD {
-            daemon_wheels.push(spec.clone());
-        } else {
+        if spec.url.is_empty() || spec.size <= DAEMON_THRESHOLD {
             uv_specs.push(format!("{}=={}", spec.distribution, spec.version));
+        } else {
+            daemon_wheels.push(spec.clone());
         }
     }
 

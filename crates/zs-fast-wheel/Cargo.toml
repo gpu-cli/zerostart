@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "Fast parallel Python wheel downloader + extractor with streaming support"
 license = "MIT"
+repository = "https://github.com/gpu-cli/zerostart"
 
 [[bin]]
 name = "zerostart"
@@ -18,7 +19,7 @@ crate-type = ["cdylib", "rlib"]
 tokio = { version = "1", features = ["full"] }
 
 # HTTP downloads
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "json", "blocking"] }
 futures = "0.3"
 
 # Zip extraction
