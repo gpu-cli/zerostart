@@ -490,15 +490,28 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // Install small wheels via uv (fast, uses uv's cache)
-            if !plan.uv_specs.is_empty() {
-                if verbose {
-                    eprintln!("Installing {} small packages via uv...", plan.uv_specs.len());
-                }
-                uv_install(&env_dir, &plan.uv_specs)?;
-            }
+            // Run uv small install + daemon streaming in parallel
+            let uv_specs = plan.uv_specs.clone();
+            let env_dir_clone = env_dir.clone();
+            let uv_verbose = verbose;
 
-            // Stream large wheels via daemon
+            let uv_handle = if !uv_specs.is_empty() {
+                if verbose {
+                    eprintln!("Installing {} small packages via uv...", uv_specs.len());
+                }
+                Some(tokio::task::spawn_blocking(move || {
+                    let result = uv_install(&env_dir_clone, &uv_specs);
+                    if uv_verbose {
+                        if let Err(ref e) = result {
+                            eprintln!("Warning: uv small install failed: {e}");
+                        }
+                    }
+                    result
+                }))
+            } else {
+                None
+            };
+
             if !plan.daemon_wheels.is_empty() {
                 if verbose {
                     eprintln!("Streaming {} large packages via daemon...", plan.daemon_wheels.len());
@@ -526,20 +539,13 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Populate uv cache with everything for next warm start
-            let all_specs: Vec<String> = plan.all.iter()
-                .map(|w| format!("{}=={}", w.distribution, w.version))
-                .collect();
-            if verbose {
-                eprintln!("Populating uv cache with {} packages...", all_specs.len());
-            }
-            if let Err(e) = uv_install(&env_dir, &all_specs) {
-                if verbose {
-                    eprintln!("Warning: uv cache population failed: {e}");
-                }
+            // Wait for uv small install to finish (if running)
+            if let Some(handle) = uv_handle {
+                handle.await??;
             }
 
-            // Mark complete
+            // Mark complete — no cache population needed.
+            // Warm path uses our venv directly, doesn't need uv's cache.
             std::fs::File::create(&complete_marker).ok();
 
             if verbose {
