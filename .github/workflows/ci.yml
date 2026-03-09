@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust ${{ matrix.check }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [test, clippy, fmt]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+      - name: cargo test
+        if: matrix.check == 'test'
+        run: cd crates && cargo test --workspace
+      - name: cargo clippy
+        if: matrix.check == 'clippy'
+        run: cd crates && cargo clippy --workspace -- -D warnings
+      - name: cargo fmt
+        if: matrix.check == 'fmt'
+        run: cd crates && cargo fmt --workspace -- --check
+
+  python:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package
+        run: cd python && pip install -e .
+      - name: Run tests
+        run: cd python && python -m pytest tests/ -v --ignore=tests/test_pyo3.py --ignore=tests/test_gpu_lazy.py --ignore=tests/test_e2e_uv.py

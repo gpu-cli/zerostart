@@ -1,7 +1,0 @@
-label,method,time_ms,files,size_mb
-small,uv_install,767,130,3
-small,zs_warm,775,116,3
-medium,uv_install,12008,5422,251
-medium,zs_warm,1286,5382,251
-ml,uv_install,97795,19697,7024
-ml,zs_warm,16217,19584,7023

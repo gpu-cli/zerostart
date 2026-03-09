@@ -10,3 +10,6 @@ bin/
 .gpu/
 .env
 .zerostart/
+*.pod-conflict
+.tmp*
+benches/results/
