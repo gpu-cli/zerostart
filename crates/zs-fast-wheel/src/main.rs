@@ -233,21 +233,107 @@ fn exec_python(
     let sp_str = site_packages.display().to_string();
     let args_str = format!("{target_args:?}");
 
+    // Inline entry point discovery — no dependency on zerostart Python package.
+    // Discovers console_scripts from dist-info/entry_points.txt, or .data/scripts/ binaries.
     let script = format!(
-        concat!(
-            "import sys\n",
-            "sys.path.insert(0, {sp_repr})\n",
-            "target = {target_repr}\n",
-            "args = {args_repr}\n",
-            "if target.endswith('.py') or __import__('pathlib').Path(target).is_file():\n",
-            "    sys.argv = [target] + args\n",
-            "    exec(compile(open(target).read(), target, 'exec'), ",
-            "{{'__name__': '__main__', '__file__': target}})\n",
-            "else:\n",
-            "    from zerostart.entrypoints import discover_entry_point, invoke_entry_point\n",
-            "    ep = discover_entry_point(target, __import__('pathlib').Path({sp_repr}))\n",
-            "    invoke_entry_point(ep, args)\n",
-        ),
+        r#"
+import sys, os, re, importlib, subprocess
+from pathlib import Path
+from configparser import ConfigParser
+
+sp = {sp_repr}
+target = {target_repr}
+args = {args_repr}
+sys.path.insert(0, sp)
+
+if target.endswith('.py') or Path(target).is_file():
+    sys.argv = [target] + args
+    exec(compile(open(target).read(), target, 'exec'),
+         {{'__name__': '__main__', '__file__': target}})
+else:
+    site = Path(sp)
+    norm = re.sub(r'[-_.]+', '-', target).lower()
+
+    # Find dist-info directory
+    dist_info = None
+    for d in site.glob('*.dist-info'):
+        stem = d.name.removesuffix('.dist-info')
+        m = re.match(r'^(.+?)-\d', stem)
+        pkg = m.group(1) if m else stem
+        if re.sub(r'[-_.]+', '-', pkg).lower() == norm:
+            dist_info = d
+            break
+
+    # Try console_scripts from entry_points.txt
+    ep = None
+    if dist_info:
+        ep_file = dist_info / 'entry_points.txt'
+        if ep_file.exists():
+            cp = ConfigParser()
+            cp.read_string(ep_file.read_text())
+            if cp.has_section('console_scripts'):
+                items = list(cp.items('console_scripts'))
+                if len(items) == 1:
+                    ep = items[0]
+                else:
+                    for name, spec in items:
+                        if re.sub(r'[-_.]+', '-', name).lower() == norm:
+                            ep = (name, spec)
+                            break
+                    if not ep:
+                        ep = items[0]
+
+    if ep:
+        name, spec = ep
+        module_name, _, attr_name = spec.partition(':')
+        sys.argv = [name] + args
+        mod = importlib.import_module(module_name.strip())
+        obj = mod
+        for part in attr_name.strip().split('.'):
+            obj = getattr(obj, part)
+        obj()
+    else:
+        # Try .data/scripts/ binary (e.g. ruff)
+        found = None
+        for data_dir in site.glob('*.data'):
+            dn = data_dir.name.removesuffix('.data') + '.dist-info'
+            m2 = re.match(r'^(.+?)-\d', dn.removesuffix('.dist-info'))
+            pkg2 = m2.group(1) if m2 else dn.removesuffix('.dist-info')
+            if re.sub(r'[-_.]+', '-', pkg2).lower() != norm:
+                continue
+            scripts = data_dir / 'scripts'
+            if scripts.is_dir():
+                for f in scripts.iterdir():
+                    if f.is_file() and os.access(f, os.X_OK):
+                        found = f
+                        if re.sub(r'[-_.]+', '-', f.name).lower() == norm:
+                            break
+            if found:
+                break
+
+        if found:
+            r = subprocess.run([str(found)] + args)
+            sys.exit(r.returncode)
+        else:
+            # Last resort: try importlib.metadata
+            try:
+                from importlib.metadata import distribution
+                dist = distribution(target)
+                for e in dist.entry_points:
+                    if e.group == 'console_scripts':
+                        module_name, _, attr_name = e.value.partition(':')
+                        sys.argv = [e.name] + args
+                        mod = importlib.import_module(module_name.strip())
+                        obj = mod
+                        for part in attr_name.strip().split('.'):
+                            obj = getattr(obj, part)
+                        obj()
+                        sys.exit(0)
+            except Exception:
+                pass
+            print(f"Error: no entry point found for '{{target}}'", file=sys.stderr)
+            sys.exit(1)
+"#,
         sp_repr = format!("'{}'", sp_str.replace('\'', "\\'")),
         target_repr = format!("'{}'", target.replace('\'', "\\'")),
         args_repr = args_str,

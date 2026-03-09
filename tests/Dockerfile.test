@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+# Install uv
+RUN pip install uv && uv --version
+
+# Copy the binary
+COPY bin/zerostart-linux-x86_64 /usr/local/bin/zerostart
+RUN chmod +x /usr/local/bin/zerostart
+
+# Verify it runs
+RUN zerostart --help
+
+# Test script
+COPY tests/docker_smoke.sh /test.sh
+RUN chmod +x /test.sh
+
+CMD ["/test.sh"]
