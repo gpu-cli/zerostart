@@ -88,17 +88,16 @@ fn lookup_pypi_wheel(
     best_specific.or(best_abi3).or(best_universal)
 }
 
-/// Size threshold: wheels larger than this go through the streaming daemon.
-/// Smaller wheels are installed via `uv pip install` (instant from cache).
-const DAEMON_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MB
-
-/// Resolved artifacts split into small (uv) and large (daemon) buckets.
+/// Resolved artifacts split by whether we have a wheel URL.
+///
+/// Packages with wheel URLs go through our streaming daemon (parallel download+extract).
+/// Packages without URLs (sdist-only) go through uv pip install (can build from source).
 pub struct ResolvedPlan {
     /// All resolved wheel specs
     pub all: Vec<WheelSpec>,
-    /// Small wheels — install via `uv pip install`
+    /// sdist-only packages — install via `uv pip install` (can build from source)
     pub uv_specs: Vec<String>,
-    /// Large wheels — stream via daemon
+    /// Packages with wheel URLs — stream via daemon (parallel download+extract)
     pub daemon_wheels: Vec<WheelSpec>,
 }
 
@@ -143,9 +142,11 @@ pub fn resolve_requirements(
     let mut daemon_wheels = Vec::new();
 
     for spec in &specs {
-        if spec.url.is_empty() || spec.size <= DAEMON_THRESHOLD {
+        if spec.url.is_empty() {
+            // sdist-only — uv builds from source
             uv_specs.push(format!("{}=={}", spec.distribution, spec.version));
         } else {
+            // Has wheel URL — stream via daemon (parallel download+extract)
             daemon_wheels.push(spec.clone());
         }
     }
@@ -268,7 +269,7 @@ fn parse_pylock(content: &str) -> Result<Vec<WheelSpec>> {
             distribution: name,
             version,
             import_roots,
-            size: 0, // forces into uv_specs bucket (< DAEMON_THRESHOLD)
+            size: 0,
             hash: None,
         });
     }

@@ -1,5 +1,5 @@
 use zs_fast_wheel::daemon::{DaemonConfig, DaemonEngine};
-use zs_fast_wheel::manifest::Manifest;
+use zs_fast_wheel::manifest::{Manifest, WheelSpec};
 use zs_fast_wheel::pipeline;
 use zs_fast_wheel::resolve;
 
@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use sha2::{Digest, Sha256};
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -409,6 +409,138 @@ fn parse_requirements_file(path: &str) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Shared wheel cache directory: `$ZEROSTART_CACHE/shared_wheels/{name}-{version}/`
+///
+/// CUDA libraries (nvidia-cuda-runtime-cu12, nvidia-cublas-cu12, etc.) are identical
+/// across environments (torch, vllm, diffusers all share ~6GB of CUDA deps).
+/// By caching extracted wheels and hardlinking them, we avoid re-downloading and
+/// re-extracting the same wheels for every environment.
+fn shared_wheel_cache_dir(spec: &WheelSpec) -> PathBuf {
+    cache_dir()
+        .join("shared_wheels")
+        .join(format!("{}-{}", spec.distribution, spec.version))
+}
+
+/// Try to restore a wheel from the shared cache via hardlinks.
+///
+/// Returns true if the wheel was fully restored from cache.
+fn restore_from_shared_cache(spec: &WheelSpec, site_packages: &Path) -> bool {
+    let cache_path = shared_wheel_cache_dir(spec);
+    let marker = cache_path.join(".complete");
+    if !marker.exists() {
+        return false;
+    }
+
+    if let Err(e) = hardlink_tree(&cache_path, site_packages) {
+        tracing::warn!(
+            "Failed to restore {} from shared cache: {e}",
+            spec.distribution
+        );
+        return false;
+    }
+
+    true
+}
+
+/// Populate the shared cache from a freshly extracted wheel in site-packages.
+///
+/// We identify the wheel's files by looking for its .dist-info directory,
+/// then copy the top-level dirs that belong to it into the cache.
+fn populate_shared_cache(spec: &WheelSpec, site_packages: &Path) {
+    let cache_path = shared_wheel_cache_dir(spec);
+    if cache_path.join(".complete").exists() {
+        return; // already cached
+    }
+
+    if std::fs::create_dir_all(&cache_path).is_err() {
+        return;
+    }
+
+    // Find this wheel's dist-info and import roots in site-packages
+    let norm = spec.distribution.replace('-', "_").to_lowercase();
+    if let Ok(entries) = std::fs::read_dir(site_packages) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy().to_string();
+
+            // Match dist-info dir or import root dirs
+            let is_dist_info = name_str.ends_with(".dist-info") && {
+                let stem = name_str.trim_end_matches(".dist-info");
+                let pkg = stem.split('-').next().unwrap_or(stem);
+                pkg.replace('-', "_").to_lowercase() == norm
+            };
+
+            let is_data_dir = name_str.ends_with(".data") && {
+                let stem = name_str.trim_end_matches(".data");
+                let pkg = stem.split('-').next().unwrap_or(stem);
+                pkg.replace('-', "_").to_lowercase() == norm
+            };
+
+            let is_import_root = spec
+                .import_roots
+                .iter()
+                .any(|r| r == &name_str || name_str == format!("{norm}.py"));
+
+            if is_dist_info || is_data_dir || is_import_root {
+                let src = entry.path();
+                let dst = cache_path.join(&name);
+                if src.is_dir() {
+                    let _ = copy_dir_recursive(&src, &dst);
+                } else {
+                    let _ = std::fs::copy(&src, &dst);
+                }
+            }
+        }
+    }
+
+    // Mark cache as complete
+    let _ = std::fs::File::create(cache_path.join(".complete"));
+}
+
+/// Recursively hardlink all files from src tree into dst.
+fn hardlink_tree(src: &Path, dst: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Skip .complete marker
+        if name_str == ".complete" {
+            continue;
+        }
+
+        let src_path = entry.path();
+        let dst_path = dst.join(&name);
+
+        if src_path.is_dir() {
+            std::fs::create_dir_all(&dst_path)?;
+            hardlink_tree(&src_path, &dst_path)?;
+        } else {
+            // Try hardlink first, fall back to copy (cross-device)
+            if std::fs::hard_link(&src_path, &dst_path).is_err() {
+                std::fs::copy(&src_path, &dst_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Recursively copy a directory.
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -483,27 +615,27 @@ async fn main() -> Result<()> {
 
             if verbose {
                 eprintln!(
-                    "Resolved: {} packages ({} via uv, {} via daemon)",
+                    "Resolved: {} packages ({} sdist via uv, {} wheels via daemon)",
                     plan.all.len(),
                     plan.uv_specs.len(),
                     plan.daemon_wheels.len(),
                 );
             }
 
-            // Run uv small install + daemon streaming in parallel
+            // Run uv sdist install + daemon streaming in parallel
             let uv_specs = plan.uv_specs.clone();
             let env_dir_clone = env_dir.clone();
             let uv_verbose = verbose;
 
             let uv_handle = if !uv_specs.is_empty() {
                 if verbose {
-                    eprintln!("Installing {} small packages via uv...", uv_specs.len());
+                    eprintln!("Installing {} sdist-only packages via uv...", uv_specs.len());
                 }
                 Some(tokio::task::spawn_blocking(move || {
                     let result = uv_install(&env_dir_clone, &uv_specs);
                     if uv_verbose {
                         if let Err(ref e) = result {
-                            eprintln!("Warning: uv small install failed: {e}");
+                            eprintln!("Warning: uv sdist install failed: {e}");
                         }
                     }
                     result
@@ -513,29 +645,64 @@ async fn main() -> Result<()> {
             };
 
             if !plan.daemon_wheels.is_empty() {
-                if verbose {
-                    eprintln!("Streaming {} large packages via daemon...", plan.daemon_wheels.len());
-                    for w in &plan.daemon_wheels {
-                        eprintln!("  {} ({:.1} MB)", w.distribution, w.size as f64 / 1024.0 / 1024.0);
+                // Check shared cache — restore cached wheels via hardlinks, only download uncached
+                let mut uncached_wheels = Vec::new();
+                let mut cached_count = 0u32;
+
+                for spec in &plan.daemon_wheels {
+                    if restore_from_shared_cache(spec, &site_packages) {
+                        cached_count += 1;
+                        if verbose {
+                            eprintln!("  {} (shared cache hit)", spec.distribution);
+                        }
+                    } else {
+                        uncached_wheels.push(spec.clone());
                     }
                 }
 
-                let config = DaemonConfig {
-                    site_packages: site_packages.clone(),
-                    parallel_downloads: 8,
-                    extract_threads: num_cpus(),
-                };
-
-                let engine = DaemonEngine::new(plan.daemon_wheels);
-                engine.run(&config).await?;
-
-                let (files, bytes) = engine.extract_stats();
                 if verbose {
-                    eprintln!(
-                        "Daemon: extracted {} files ({:.1} MB)",
-                        files,
-                        bytes as f64 / 1024.0 / 1024.0
-                    );
+                    if cached_count > 0 {
+                        eprintln!(
+                            "Shared cache: {cached_count} wheels restored, {} to download",
+                            uncached_wheels.len()
+                        );
+                    }
+                    if !uncached_wheels.is_empty() {
+                        eprintln!("Streaming {} packages via daemon...", uncached_wheels.len());
+                        for w in &uncached_wheels {
+                            eprintln!("  {} ({:.1} MB)", w.distribution, w.size as f64 / 1024.0 / 1024.0);
+                        }
+                    }
+                }
+
+                if !uncached_wheels.is_empty() {
+                    let config = DaemonConfig {
+                        site_packages: site_packages.clone(),
+                        parallel_downloads: 8,
+                        extract_threads: num_cpus(),
+                    };
+
+                    let wheels_to_cache: Vec<WheelSpec> = uncached_wheels.clone();
+                    let engine = DaemonEngine::new(uncached_wheels);
+                    engine.run(&config).await?;
+
+                    let (files, bytes) = engine.extract_stats();
+                    if verbose {
+                        eprintln!(
+                            "Daemon: extracted {} files ({:.1} MB)",
+                            files,
+                            bytes as f64 / 1024.0 / 1024.0
+                        );
+                    }
+
+                    // Populate shared cache for newly extracted wheels
+                    let sp_for_cache = site_packages.clone();
+                    tokio::task::spawn_blocking(move || {
+                        for spec in &wheels_to_cache {
+                            populate_shared_cache(spec, &sp_for_cache);
+                        }
+                    })
+                    .await?;
                 }
             }
 
