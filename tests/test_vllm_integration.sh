@@ -162,7 +162,7 @@ r = subprocess.run(
 elapsed = time.monotonic() - t0
 print(r.stdout.strip())
 if r.returncode != 0:
-    print("STDERR:", r.stderr[-1000:])
+    print("STDERR:", r.stderr[-1500:])
 print(f"Wall clock: {elapsed:.2f}s")
 PYEOF
 
