@@ -603,13 +603,14 @@ def _reconstruct_module(
 
             model_config = config_class.from_dict(config["config_dict"])
 
-            # Skip random weight initialization — we're about to replace all
-            # weights from safetensors anyway. This is how from_pretrained does
-            # it internally, saving ~80s for a 7B model.
+            # Create model on meta device (zero memory allocation) then
+            # replace meta tensors with real data via load_state_dict(assign=True).
+            # This matches how from_pretrained works: 0.4s instead of 80s.
             with _no_init_weights():
-                module = model_class(model_config)
+                with torch.device("meta"):
+                    module = model_class(model_config)
 
-            log.info("Reconstructed %s from config (no-init)", config["_class"])
+            log.info("Reconstructed %s from config (meta device)", config["_class"])
         except Exception as e:
             log.warning("Failed to reconstruct from config: %s", e)
 
