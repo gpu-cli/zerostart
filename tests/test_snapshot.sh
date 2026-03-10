@@ -49,8 +49,12 @@ t2 = time.monotonic()
 log.info("Tokenizer loaded: %.2fs", t2 - t1)
 
 model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32)
+model.eval()
 t3 = time.monotonic()
 log.info("Model loaded: %.2fs", t3 - t2)
+
+# Save state dict for comparison later
+original_sd = {k: v.clone() for k, v in model.state_dict().items()}
 
 # Quick inference to verify model works
 inputs = tokenizer("Hello, world!", return_tensors="pt")
@@ -105,7 +109,24 @@ t8 = time.monotonic()
 log.info("Hydrate: %.2fs", t8 - t7)
 
 model2 = restored["model"]
+model2.eval()
 tokenizer2 = restored["tokenizer"]
+
+# Compare weights
+hydrated_sd = model2.state_dict()
+weight_match = True
+for key in original_sd:
+    if key not in hydrated_sd:
+        log.warning("Missing key in hydrated model: %s", key)
+        weight_match = False
+        continue
+    if not torch.equal(original_sd[key], hydrated_sd[key]):
+        diff = (original_sd[key].float() - hydrated_sd[key].float()).abs().max().item()
+        log.warning("Weight mismatch: %s (max diff: %e, shapes: %s vs %s)",
+                     key, diff, original_sd[key].shape, hydrated_sd[key].shape)
+        weight_match = False
+log.info("Weight comparison: %s (%d/%d keys)", "PASS" if weight_match else "FAIL",
+         len(hydrated_sd), len(original_sd))
 
 # Verify restored model produces same output
 inputs2 = tokenizer2("Hello, world!", return_tensors="pt")
