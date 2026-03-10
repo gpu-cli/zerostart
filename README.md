@@ -167,6 +167,22 @@ cache.list_entries()                    # Show cached models
 cache.auto_evict(max_size_bytes=50e9)   # LRU eviction to stay under 50GB
 ```
 
+### vLLM Integration
+
+A custom model loader for vLLM that switches safetensors loading from mmap to eager read on network filesystems (NFS, JuiceFS, CIFS) where mmap page faults are 30-50x slower.
+
+**Not enabled by default.** On most container providers (RunPod, Vast.ai), the kernel page cache makes mmap fast enough. The eager path only helps on cold reads from truly slow network storage.
+
+```bash
+# Opt in via --load-format
+vllm serve Qwen/Qwen2.5-7B --load-format zerostart
+
+# Or via env var
+ZEROSTART_EAGER=1 vllm serve Qwen/Qwen2.5-7B --load-format zerostart
+```
+
+Auto-registers via vLLM's plugin system when zerostart is installed (`pip install zerostart`).
+
 ### Serving Integration
 
 For custom serving stacks:
