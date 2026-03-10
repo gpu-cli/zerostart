@@ -290,16 +290,19 @@ def snapshot(
     unmatched: list[str] = []
 
     for ref_key, ref_info in tensor_map.items():
-        # ref_key is like "model.layers.0.self_attn.q_proj.weight"
-        # safetensors tensor name might be "model.layers.0.self_attn.q_proj.weight"
-        # or just "layers.0.self_attn.q_proj.weight" — try both
+        # ref_key is like "model.transformer.h.0.attn.bias"
+        # safetensors key might be any suffix: "transformer.h.0.attn.bias",
+        # "h.0.attn.bias", or the full key. Try progressively stripping
+        # dot-separated prefixes until we find a match.
 
-        # Strip the top-level state key (e.g., "model.")
-        parts = ref_key.split(".", 1)
-        param_name = parts[1] if len(parts) > 1 else ref_key
+        candidates = [ref_key]
+        remaining = ref_key
+        while "." in remaining:
+            remaining = remaining.split(".", 1)[1]
+            candidates.append(remaining)
 
         matched = False
-        for candidate in [param_name, ref_key]:
+        for candidate in candidates:
             if candidate in tensor_to_file:
                 sf_path, sf_tensor_name = tensor_to_file[candidate]
                 tensor_file_refs[ref_key] = {
