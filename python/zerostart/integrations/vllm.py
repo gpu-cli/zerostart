@@ -16,9 +16,14 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from zerostart.model_cache import ModelCache, cache_key
+
+if TYPE_CHECKING:
+    import torch.nn as nn
+    from vllm.config import ModelConfig
+    from vllm.config.load import LoadConfig
 
 log = logging.getLogger("zerostart.vllm")
 
@@ -29,27 +34,54 @@ def register() -> None:
     After calling this, you can use --load-format zerostart with vLLM.
     """
     try:
-        from vllm.model_executor.model_loader import loader
-        loader._MODEL_LOADER_REGISTRY["zerostart"] = ZerostartModelLoader
+        from vllm.model_executor.model_loader import register_model_loader
+        register_model_loader("zerostart")(ZerostartModelLoader)
         log.info("Registered zerostart model loader with vLLM")
     except ImportError:
-        log.warning("vLLM not installed — cannot register model loader")
-    except AttributeError:
-        log.warning("vLLM version does not support custom model loaders")
+        # Fallback for older vLLM versions
+        try:
+            import vllm.model_executor.model_loader as ml
+            registry = getattr(ml, "_LOAD_FORMAT_TO_MODEL_LOADER", None)
+            if registry is None:
+                registry = getattr(ml, "_MODEL_LOADER_REGISTRY", None)
+            if registry is not None:
+                registry["zerostart"] = ZerostartModelLoader
+                log.info("Registered zerostart model loader with vLLM (legacy)")
+            else:
+                log.warning("Cannot find vLLM model loader registry")
+        except ImportError:
+            log.warning("vLLM not installed — cannot register model loader")
+    except Exception as e:
+        log.warning("Failed to register with vLLM: %s", e)
 
 
-class ZerostartModelLoader:
+def _get_base_class() -> type:
+    """Get BaseModelLoader, falling back to object if not available."""
+    try:
+        from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+        return BaseModelLoader
+    except ImportError:
+        return object
+
+
+# Dynamically set base class so we don't fail on import if vLLM isn't installed
+_Base = _get_base_class()
+
+
+class ZerostartModelLoader(_Base):  # type: ignore[misc]
     """vLLM model loader using zerostart's mmap hydrate.
 
     First load: delegates to default loader, auto-snapshots.
     Subsequent loads: mmap hydrate from cache (4x faster).
     """
 
-    def __init__(self, load_config: Any):
+    def __init__(self, load_config: LoadConfig):
+        if _Base is not object:
+            super().__init__(load_config)
         self.load_config = load_config
         self.cache = ModelCache()
 
-    def download_model(self, model_config: Any) -> None:
+    def download_model(self, model_config: ModelConfig) -> None:
         """Download model via HF hub (standard path)."""
         try:
             from huggingface_hub import snapshot_download
@@ -60,7 +92,7 @@ class ZerostartModelLoader:
         except Exception as e:
             log.warning("HF download failed, vLLM will handle: %s", e)
 
-    def load_weights(self, model: Any, model_config: Any) -> None:
+    def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
         """Load weights from cache or standard path."""
         key = cache_key(model_config.model, {
             "dtype": str(getattr(model_config, "dtype", "auto")),
@@ -73,10 +105,11 @@ class ZerostartModelLoader:
             cached_model = state.get("model")
             if cached_model is not None:
                 # Transfer weights from cached model to vLLM's model
-                try:
-                    model.load_weights(cached_model.state_dict().items())
-                except AttributeError:
-                    model.load_state_dict(cached_model.state_dict(), strict=False)
+                sd = cached_model.state_dict()
+                if hasattr(model, "load_weights"):
+                    model.load_weights(sd.items())
+                else:
+                    model.load_state_dict(sd, strict=False)
                 log.info(
                     "Loaded from zerostart cache (%.2fs)",
                     time.monotonic() - t0,
@@ -85,14 +118,12 @@ class ZerostartModelLoader:
 
         # Standard load, then cache
         t0 = time.monotonic()
-        try:
-            from vllm.model_executor.model_loader.loader import DefaultModelLoader
-            default = DefaultModelLoader(self.load_config)
-            default.load_weights(model, model_config)
-        except ImportError:
+        default_loader = self._get_default_loader()
+        if default_loader is None:
             log.warning("Cannot import DefaultModelLoader — weights not loaded")
             return
 
+        default_loader.load_weights(model, model_config)
         elapsed = time.monotonic() - t0
         log.info("Standard load (%.2fs), caching for next time", elapsed)
 
@@ -105,3 +136,17 @@ class ZerostartModelLoader:
             )
         except Exception as e:
             log.warning("Auto-cache failed: %s", e)
+
+    def _get_default_loader(self) -> Any:
+        """Get vLLM's default model loader as fallback."""
+        try:
+            from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+            return DefaultModelLoader(self.load_config)
+        except ImportError:
+            pass
+        try:
+            from vllm.model_executor.model_loader.loader import DefaultModelLoader
+            return DefaultModelLoader(self.load_config)
+        except ImportError:
+            pass
+        return None
