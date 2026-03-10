@@ -151,7 +151,7 @@ t1 = time.monotonic()
 print(f"Snapshot created in {t1-t0:.2f}s")
 PYEOF
 
-$ZS run -p torch -p transformers -p accelerate -p cloudpickle "$BENCH_DIR/bench_create_snap.py" 2>&1 | tail -30
+$ZS run -p torch -p transformers -p accelerate "$BENCH_DIR/bench_create_snap.py" 2>&1 | tail -30
 
 echo ""
 echo "--- Scenario 4: zerostart warm + hydrate + inference ---"
@@ -188,7 +188,7 @@ print(f"TIME import={t_import-t_script:.2f}s hydrate={t_hydrate-t_import:.2f}s i
 PYEOF
 
 ZS_HYD_START=$(date +%s%3N)
-$ZS run -p torch -p transformers -p accelerate -p cloudpickle "$BENCH_DIR/bench_hydrate.py" 2>&1 | tail -30
+$ZS run -p torch -p transformers -p accelerate "$BENCH_DIR/bench_hydrate.py" 2>&1 | tail -30
 ZS_HYD_END=$(date +%s%3N)
 echo "  Total wall clock (zerostart warm + hydrate + inference): $(( ZS_HYD_END - ZS_HYD_START ))ms"
 echo ""

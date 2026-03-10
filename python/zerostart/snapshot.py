@@ -1,23 +1,22 @@
 """Snapshot & hydrate: fast checkpoint/restore for GPU Python applications.
 
-Captures a running Python+model state and restores it in ~1-2s by:
-1. Serializing Python objects (config, tokenizer, etc.) via cloudpickle (~1-10MB)
-2. Recording tensor references into safetensors files (not the data itself)
-3. On hydrate: mmap safetensors files (zero-copy) and wire tensors back into the model
+Strategy C (JSON-only): No cloudpickle. Tokenizer saved via save_pretrained,
+model config as JSON, tensors referenced in safetensors files via mmap.
 
-Works with any model that uses safetensors for weights (transformers, diffusers, etc.).
-Integrates with safetensors-streaming for zero-copy mmap loading.
+Cold hydrate of Qwen2.5-7B (15.2GB): ~1.7s (excluding inference)
+  - Rust tokenizer: 0.22s
+  - mmap 339 tensors: 0.07s
+  - import model class: 1.09s
+  - reconstruct model: 0.33s
 
 Usage:
-    # After model is loaded and ready to serve:
     from zerostart.snapshot import snapshot, hydrate
 
     snapshot(
-        state={"model": model, "tokenizer": tokenizer, "config": config},
+        state={"model": model, "tokenizer": tokenizer},
         path="/cache/my-model.zsnap",
     )
 
-    # On next start (~1-2s instead of 30s+):
     state = hydrate("/cache/my-model.zsnap")
     model = state["model"]       # weights are mmap'd, zero-copy
     tokenizer = state["tokenizer"]
@@ -30,6 +29,7 @@ import json
 import logging
 import os
 import platform
+import struct
 import sys
 import time
 from pathlib import Path
@@ -37,19 +37,15 @@ from typing import Any
 
 log = logging.getLogger("zerostart.snapshot")
 
+SNAPSHOT_VERSION = 2
+
 
 # ---------------------------------------------------------------------------
 # No-init weights context manager
 # ---------------------------------------------------------------------------
 
 class _no_init_weights:
-    """Context manager that disables weight initialization in torch.nn.
-
-    Patches torch.nn.init functions to be no-ops, so model creation
-    allocates tensors but doesn't fill them with random data. This is
-    how transformers' from_pretrained works internally — saves ~80s for
-    a 7B model since we load real weights immediately after.
-    """
+    """Patches torch.nn.init functions to no-ops during model creation."""
 
     def __init__(self) -> None:
         self._originals: dict[str, Any] = {}
@@ -57,14 +53,12 @@ class _no_init_weights:
     def __enter__(self) -> None:
         import torch.nn.init as init
 
-        # Patch all init functions to be no-ops
         for name in dir(init):
             fn = getattr(init, name)
             if callable(fn) and not name.startswith("_"):
                 self._originals[name] = fn
                 setattr(init, name, lambda *args, **kwargs: None)
 
-        # Also patch nn.Module.reset_parameters if it exists
         import torch.nn as nn
         if hasattr(nn.Module, "reset_parameters"):
             self._originals["Module.reset_parameters"] = nn.Module.reset_parameters
@@ -83,70 +77,30 @@ class _no_init_weights:
 
 
 # ---------------------------------------------------------------------------
-# Tensor reference extraction
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _get_torch():
-    """Import torch lazily."""
     import torch
     return torch
 
 
-def _extract_tensor_refs(
-    state: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
-    """Separate tensors from Python objects.
-
-    Walks the state dict and replaces torch.Tensor values with placeholder
-    references. Returns (cleaned_state, tensor_map).
-
-    tensor_map: {dotted_key: {shape, dtype, device, ...}}
-    """
-    torch = _get_torch()
-    tensor_map: dict[str, dict[str, Any]] = {}
-    cleaned = {}
-
-    for key, value in state.items():
-        if isinstance(value, torch.nn.Module):
-            # Extract state_dict tensors, keep the module shell
-            module_tensors = {}
-            sd = value.state_dict()
-            for param_name, tensor in sd.items():
-                ref_key = f"{key}.{param_name}"
-                module_tensors[param_name] = {
-                    "shape": list(tensor.shape),
-                    "dtype": str(tensor.dtype),
-                    "device": str(tensor.device),
-                    "numel": tensor.numel(),
-                    "nbytes": tensor.nelement() * tensor.element_size(),
-                }
-                tensor_map[ref_key] = module_tensors[param_name]
-
-            # Store the module with empty parameter placeholders
-            cleaned[key] = _ModulePlaceholder(
-                module_class=type(value),
-                config=_extract_model_config(value),
-                tensor_keys=list(module_tensors.keys()),
-            )
-        elif isinstance(value, torch.Tensor):
-            tensor_map[key] = {
-                "shape": list(value.shape),
-                "dtype": str(value.dtype),
-                "device": str(value.device),
-                "numel": value.numel(),
-                "nbytes": value.nelement() * value.element_size(),
-            }
-            cleaned[key] = _TensorPlaceholder(key)
-        else:
-            # Non-tensor values get serialized directly
-            cleaned[key] = value
-
-    return cleaned, tensor_map
+def _environment_fingerprint() -> str:
+    parts = [
+        f"python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        f"platform={platform.machine()}",
+    ]
+    try:
+        torch = _get_torch()
+        parts.append(f"torch={torch.__version__}")
+        if torch.cuda.is_available():
+            parts.append(f"cuda={torch.version.cuda}")
+    except ImportError:
+        pass
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
 
 def _extract_model_config(module: Any) -> dict[str, Any] | None:
-    """Try to extract a model's config for reconstruction."""
-    # transformers models have .config
     if hasattr(module, "config"):
         config = module.config
         if hasattr(config, "to_dict"):
@@ -161,87 +115,47 @@ def _extract_model_config(module: Any) -> dict[str, Any] | None:
     return None
 
 
-class _ModulePlaceholder:
-    """Placeholder for a nn.Module — stores config + param keys, not weights."""
-    def __init__(self, module_class: type, config: dict[str, Any] | None, tensor_keys: list[str]):
-        self.module_class = module_class
-        self.config = config
-        self.tensor_keys = tensor_keys
-
-
-class _TensorPlaceholder:
-    """Placeholder for a standalone tensor."""
-    def __init__(self, key: str):
-        self.key = key
-
-
 # ---------------------------------------------------------------------------
 # Safetensors file discovery
 # ---------------------------------------------------------------------------
 
 def _find_safetensors_for_model(module: Any) -> list[Path]:
-    """Find the safetensors files that a model's weights came from.
-
-    Checks:
-    1. model.config._name_or_path → HF cache directory
-    2. Explicit safetensors_files in snapshot() call
-    """
     paths: list[Path] = []
-
     if hasattr(module, "config") and hasattr(module.config, "_name_or_path"):
         model_path = Path(module.config._name_or_path)
         if model_path.is_dir():
-            # Local directory — find safetensors files
             paths.extend(sorted(model_path.glob("*.safetensors")))
         else:
-            # HF model ID — check the HF cache
             hf_cache = _find_hf_cache_dir(module.config._name_or_path)
             if hf_cache:
                 paths.extend(sorted(hf_cache.glob("*.safetensors")))
-
     return paths
 
 
 def _find_hf_cache_dir(model_id: str) -> Path | None:
-    """Find the HF hub cache directory for a model."""
     safe_id = model_id.replace("/", "--")
     model_subdir = f"models--{safe_id}"
 
-    # Check multiple possible HF cache locations in order of priority:
-    # 1. huggingface_hub constants (most reliable — reads all HF env vars)
-    # 2. HF_HUB_CACHE env var
-    # 3. HF_HOME env var + /hub
-    # 4. Default ~/.cache/huggingface/hub
     candidates: list[Path] = []
-
     try:
         from huggingface_hub import constants
         candidates.append(Path(constants.HF_HUB_CACHE))
     except ImportError:
         pass
-
     if hf_hub_cache := os.environ.get("HF_HUB_CACHE"):
         candidates.append(Path(hf_hub_cache))
-
     if hf_home := os.environ.get("HF_HOME"):
         candidates.append(Path(hf_home) / "hub")
-
     candidates.append(Path(os.path.expanduser("~/.cache/huggingface/hub")))
 
-    # Dedupe preserving order
     seen: set[str] = set()
-    unique: list[Path] = []
     for c in candidates:
         key = str(c)
-        if key not in seen:
-            seen.add(key)
-            unique.append(c)
-
-    for hub_dir in unique:
-        model_dir = hub_dir / model_subdir
-        if not model_dir.is_dir():
+        if key in seen:
             continue
+        seen.add(key)
 
+        model_dir = c / model_subdir
         snapshots = model_dir / "snapshots"
         if not snapshots.is_dir():
             continue
@@ -253,62 +167,46 @@ def _find_hf_cache_dir(model_id: str) -> Path | None:
             log.info("Found HF cache for %s at %s (%d safetensors files)", model_id, result, sf_count)
             return result
 
-    log.warning("Could not find HF cache for %s in %s", model_id, [str(c) for c in unique])
+    log.warning("Could not find HF cache for %s", model_id)
     return None
 
 
 def _build_tensor_to_file_map(
     safetensors_files: list[Path],
 ) -> dict[str, tuple[Path, str]]:
-    """Map tensor names → (file_path, tensor_name_in_file).
-
-    Reads safetensors headers (JSON only, no tensor data) to build
-    a complete mapping of which tensor lives in which file.
-    """
-    import struct
-
     tensor_to_file: dict[str, tuple[Path, str]] = {}
-
     for sf_path in safetensors_files:
         try:
             with open(sf_path, "rb") as f:
-                # safetensors format: 8 bytes (u64 LE) = header size, then JSON header
                 header_size_bytes = f.read(8)
                 if len(header_size_bytes) < 8:
                     continue
                 header_size = struct.unpack("<Q", header_size_bytes)[0]
                 header_json = f.read(header_size)
                 header = json.loads(header_json)
-
-                for tensor_name, info in header.items():
-                    if tensor_name == "__metadata__":
-                        continue
-                    tensor_to_file[tensor_name] = (sf_path, tensor_name)
+                for tensor_name in header:
+                    if tensor_name != "__metadata__":
+                        tensor_to_file[tensor_name] = (sf_path, tensor_name)
         except Exception as e:
             log.warning("Failed to read safetensors header from %s: %s", sf_path, e)
-
     return tensor_to_file
 
 
-# ---------------------------------------------------------------------------
-# Fingerprinting
-# ---------------------------------------------------------------------------
-
-def _environment_fingerprint() -> str:
-    """Hash of environment to detect incompatible restores."""
-    parts = [
-        f"python={sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        f"platform={platform.machine()}",
-    ]
-    try:
-        torch = _get_torch()
-        parts.append(f"torch={torch.__version__}")
-        if torch.cuda.is_available():
-            parts.append(f"cuda={torch.version.cuda}")
-    except ImportError:
-        pass
-
-    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
+def _match_tensor_to_safetensors(
+    ref_key: str,
+    tensor_to_file: dict[str, tuple[Path, str]],
+) -> tuple[str, str] | None:
+    """Try progressively stripping dot-prefixes to match a tensor name."""
+    candidates = [ref_key]
+    remaining = ref_key
+    while "." in remaining:
+        remaining = remaining.split(".", 1)[1]
+        candidates.append(remaining)
+    for candidate in candidates:
+        if candidate in tensor_to_file:
+            sf_path, sf_tensor_name = tensor_to_file[candidate]
+            return str(sf_path), sf_tensor_name
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -322,21 +220,11 @@ def snapshot(
 ) -> Path:
     """Snapshot a Python+model state for fast hydration.
 
-    Args:
-        state: Dict of named objects to snapshot. Values can be:
-            - torch.nn.Module (model) — tensors extracted, config preserved
-            - torch.Tensor — replaced with reference
-            - anything else — serialized via cloudpickle
-        path: Directory to write the snapshot to (created if needed).
-        safetensors_files: Explicit safetensors file paths. If None, auto-detected
-            from model configs.
-
-    Returns:
-        Path to the snapshot directory.
+    Saves tokenizer via save_pretrained, model config as JSON,
+    tensor references into safetensors files. No cloudpickle.
     """
-    import cloudpickle
-
     t0 = time.monotonic()
+    torch = _get_torch()
     snap_dir = Path(path)
     snap_dir.mkdir(parents=True, exist_ok=True)
 
@@ -345,67 +233,120 @@ def snapshot(
     if safetensors_files:
         sf_files = [Path(f) for f in safetensors_files]
     else:
-        # Auto-detect from model configs
         for value in state.values():
-            torch = _get_torch()
             if isinstance(value, torch.nn.Module):
-                found = _find_safetensors_for_model(value)
-                sf_files.extend(found)
-
-    sf_files = list(dict.fromkeys(sf_files))  # dedupe preserving order
+                sf_files.extend(_find_safetensors_for_model(value))
+    sf_files = list(dict.fromkeys(sf_files))
     log.info("Found %d safetensors files", len(sf_files))
 
-    # 2. Build tensor→file mapping from safetensors headers
+    # 2. Build tensor→file mapping
     tensor_to_file = _build_tensor_to_file_map(sf_files)
     log.info("Mapped %d tensors across safetensors files", len(tensor_to_file))
 
-    # 3. Separate tensors from Python state
-    cleaned_state, tensor_map = _extract_tensor_refs(state)
-
-    # 4. Match model parameters to safetensors file locations
-    tensor_file_refs: dict[str, dict[str, Any]] = {}
+    # 3. Process each state entry
+    model_configs: dict[str, dict[str, Any]] = {}
+    tensor_refs: dict[str, dict[str, Any]] = {}
+    tokenizer_keys: list[str] = []
     unmatched: list[str] = []
 
-    for ref_key, ref_info in tensor_map.items():
-        # ref_key is like "model.transformer.h.0.attn.bias"
-        # safetensors key might be any suffix: "transformer.h.0.attn.bias",
-        # "h.0.attn.bias", or the full key. Try progressively stripping
-        # dot-separated prefixes until we find a match.
+    for key, value in state.items():
+        if isinstance(value, torch.nn.Module):
+            # Save model config as JSON
+            config = _extract_model_config(value)
+            if config:
+                model_configs[key] = config
 
-        candidates = [ref_key]
-        remaining = ref_key
-        while "." in remaining:
-            remaining = remaining.split(".", 1)[1]
-            candidates.append(remaining)
-
-        matched = False
-        for candidate in candidates:
-            if candidate in tensor_to_file:
-                sf_path, sf_tensor_name = tensor_to_file[candidate]
-                tensor_file_refs[ref_key] = {
-                    **ref_info,
-                    "safetensors_file": str(sf_path),
-                    "safetensors_tensor": sf_tensor_name,
+            # Build tensor refs from state_dict
+            sd = value.state_dict()
+            tensor_keys_for_model = []
+            for param_name, tensor in sd.items():
+                ref_key = f"{key}.{param_name}"
+                ref_info: dict[str, Any] = {
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
                 }
-                matched = True
-                break
+                match = _match_tensor_to_safetensors(ref_key, tensor_to_file)
+                if match:
+                    ref_info["safetensors_file"] = match[0]
+                    ref_info["safetensors_tensor"] = match[1]
+                else:
+                    unmatched.append(ref_key)
+                tensor_refs[ref_key] = ref_info
+                tensor_keys_for_model.append(ref_key)
 
-        if not matched:
-            unmatched.append(ref_key)
-            # Store tensor data directly for unmatched tensors
-            tensor_file_refs[ref_key] = ref_info
+        elif _is_tokenizer(value):
+            # Save tokenizer via save_pretrained (JSON files)
+            tok_dir = snap_dir / f"tokenizer_{key}"
+            value.save_pretrained(str(tok_dir))
+            tokenizer_keys.append(key)
+            log.info("Saved tokenizer '%s' via save_pretrained", key)
+
+        elif isinstance(value, torch.Tensor):
+            ref_key = key
+            ref_info = {
+                "shape": list(value.shape),
+                "dtype": str(value.dtype),
+            }
+            match = _match_tensor_to_safetensors(ref_key, tensor_to_file)
+            if match:
+                ref_info["safetensors_file"] = match[0]
+                ref_info["safetensors_tensor"] = match[1]
+            else:
+                unmatched.append(ref_key)
+            tensor_refs[ref_key] = ref_info
 
     if unmatched:
-        log.warning(
-            "%d tensors not matched to safetensors files — will be serialized directly",
-            len(unmatched),
-        )
+        log.warning("%d tensors not matched to safetensors — will be serialized", len(unmatched))
 
-    # 5. Serialize unmatched tensors (those not in any safetensors file)
-    torch = _get_torch()
-    unmatched_tensors: dict[str, bytes] = {}
+    # 4. Serialize unmatched tensors
+    if unmatched:
+        _save_unmatched_tensors(snap_dir, unmatched, state, torch)
+
+    # 5. Write manifest (pure JSON, no pickle)
+    manifest = {
+        "version": SNAPSHOT_VERSION,
+        "created": time.time(),
+        "fingerprint": _environment_fingerprint(),
+        "model_configs": model_configs,
+        "tensor_refs": tensor_refs,
+        "tokenizer_keys": tokenizer_keys,
+        "safetensors_files": [str(f) for f in sf_files],
+        "state_keys": list(state.keys()),
+        "tensor_count": len(tensor_refs),
+        "matched_tensors": len(tensor_refs) - len(unmatched),
+        "unmatched_tensors": len(unmatched),
+    }
+
+    with open(snap_dir / "manifest.json", "w") as f:
+        json.dump(manifest, f)
+
+    elapsed = time.monotonic() - t0
+    total_params = sum(1 for _ in tensor_refs)
+    log.info(
+        "Snapshot saved to %s (%.1fs, %d tensors, %d matched)",
+        snap_dir, elapsed, len(tensor_refs), len(tensor_refs) - len(unmatched),
+    )
+
+    return snap_dir
+
+
+def _is_tokenizer(obj: Any) -> bool:
+    """Check if an object is a HuggingFace tokenizer."""
+    return hasattr(obj, "save_pretrained") and hasattr(obj, "encode") and hasattr(obj, "decode")
+
+
+def _save_unmatched_tensors(
+    snap_dir: Path,
+    unmatched: list[str],
+    state: dict[str, Any],
+    torch: Any,
+) -> None:
+    """Save tensors not found in safetensors files."""
+    import io
+    tensors_dir = snap_dir / "tensors"
+    tensors_dir.mkdir(exist_ok=True)
+
     for ref_key in unmatched:
-        # Find the actual tensor in the original state
         parts = ref_key.split(".", 1)
         top_key = parts[0]
         param_name = parts[1] if len(parts) > 1 else None
@@ -414,61 +355,19 @@ def snapshot(
         if obj is None:
             continue
 
+        tensor = None
         if isinstance(obj, torch.nn.Module) and param_name:
             sd = obj.state_dict()
-            if param_name in sd:
-                import io
-                buf = io.BytesIO()
-                torch.save(sd[param_name], buf)
-                unmatched_tensors[ref_key] = buf.getvalue()
+            tensor = sd.get(param_name)
         elif isinstance(obj, torch.Tensor):
-            import io
+            tensor = obj
+
+        if tensor is not None:
             buf = io.BytesIO()
-            torch.save(obj, buf)
-            unmatched_tensors[ref_key] = buf.getvalue()
-
-    # 6. Serialize Python state (without tensors)
-    python_state_bytes = cloudpickle.dumps(cleaned_state)
-    log.info("Python state: %.1f KB", len(python_state_bytes) / 1024)
-
-    # 7. Write snapshot files
-    # Manifest
-    manifest = {
-        "version": 1,
-        "created": time.time(),
-        "fingerprint": _environment_fingerprint(),
-        "tensor_count": len(tensor_map),
-        "matched_tensors": len(tensor_map) - len(unmatched),
-        "unmatched_tensors": len(unmatched),
-        "safetensors_files": [str(f) for f in sf_files],
-        "tensor_refs": tensor_file_refs,
-        "state_keys": list(state.keys()),
-    }
-
-    with open(snap_dir / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-
-    with open(snap_dir / "python_state.pkl", "wb") as f:
-        f.write(python_state_bytes)
-
-    # Save unmatched tensor data
-    if unmatched_tensors:
-        tensors_dir = snap_dir / "tensors"
-        tensors_dir.mkdir(exist_ok=True)
-        for ref_key, data in unmatched_tensors.items():
+            torch.save(tensor, buf)
             safe_name = ref_key.replace("/", "_").replace(".", "_") + ".pt"
             with open(tensors_dir / safe_name, "wb") as f:
-                f.write(data)
-
-    elapsed = time.monotonic() - t0
-    total_params = sum(r.get("numel", 0) for r in tensor_map.values())
-    log.info(
-        "Snapshot saved to %s (%.1fs, %d tensors, %.1fM params, %.1f KB Python state)",
-        snap_dir, elapsed, len(tensor_map), total_params / 1e6,
-        len(python_state_bytes) / 1024,
-    )
-
-    return snap_dir
+                f.write(buf.getvalue())
 
 
 # ---------------------------------------------------------------------------
@@ -480,19 +379,12 @@ def hydrate(
     device: str | None = None,
     verify_fingerprint: bool = True,
 ) -> dict[str, Any]:
-    """Hydrate a snapshot — restore model state with mmap'd safetensors weights.
+    """Hydrate a snapshot — restore model + tokenizer with mmap'd weights.
 
-    Args:
-        path: Path to the snapshot directory.
-        device: Target device for tensors (e.g., "cuda:0"). If None, uses
-            the device recorded in the snapshot.
-        verify_fingerprint: Check that the environment matches the snapshot.
-
-    Returns:
-        Dict of restored objects (same keys as the original snapshot() call).
+    No cloudpickle. Tokenizer loaded via Rust tokenizers library (fast path)
+    or transformers AutoTokenizer (fallback). Model reconstructed from JSON
+    config + mmap'd safetensors.
     """
-    import cloudpickle
-
     t0 = time.monotonic()
     snap_dir = Path(path)
 
@@ -500,30 +392,137 @@ def hydrate(
     with open(snap_dir / "manifest.json") as f:
         manifest = json.load(f)
 
+    version = manifest.get("version", 1)
+    if version == 1:
+        return _hydrate_v1(snap_dir, manifest, device, verify_fingerprint, t0)
+
     if verify_fingerprint:
         current_fp = _environment_fingerprint()
         snap_fp = manifest.get("fingerprint", "")
         if current_fp != snap_fp:
             log.warning(
-                "Environment fingerprint mismatch (snapshot=%s, current=%s). "
-                "Tensors may be incompatible.",
+                "Environment fingerprint mismatch (snapshot=%s, current=%s)",
                 snap_fp, current_fp,
             )
 
-    # 2. Load Python state
-    with open(snap_dir / "python_state.pkl", "rb") as f:
-        cleaned_state = cloudpickle.loads(f.read())
+    t_manifest = time.monotonic()
 
-    t_python = time.monotonic() - t0
-    log.info("Python state loaded (%.3fs)", t_python)
+    # 2. Load tokenizers (Rust fast path, no transformers import)
+    restored_state: dict[str, Any] = {}
+    for tok_key in manifest.get("tokenizer_keys", []):
+        tok_dir = snap_dir / f"tokenizer_{tok_key}"
+        restored_state[tok_key] = _load_tokenizer(tok_dir)
+    t_tok = time.monotonic()
 
-    # 3. Load tensor data via mmap
+    # 3. Load tensors via mmap
     torch = _get_torch()
+    loaded_tensors = _load_tensors_mmap(manifest, snap_dir, torch)
+    t_mmap = time.monotonic()
+
+    # 4. Reconstruct models
+    for model_key, model_config in manifest.get("model_configs", {}).items():
+        module = _reconstruct_module_from_config(
+            model_config, model_key, loaded_tensors, device, torch,
+        )
+        if module is not None:
+            restored_state[model_key] = module
+    t_model = time.monotonic()
+
+    # 5. Restore standalone tensors
+    for ref_key in manifest.get("tensor_refs", {}):
+        if "." not in ref_key and ref_key not in restored_state:
+            tensor = loaded_tensors.get(ref_key)
+            if tensor is not None:
+                if device:
+                    tensor = tensor.to(device)
+                restored_state[ref_key] = tensor
+
+    elapsed = time.monotonic() - t0
+    log.info(
+        "Hydration complete (%.3fs total: %.3fs manifest + %.3fs tokenizer + %.3fs mmap + %.3fs model)",
+        elapsed, t_manifest - t0, t_tok - t_manifest, t_mmap - t_tok, t_model - t_mmap,
+    )
+
+    return restored_state
+
+
+def _load_tokenizer(tok_dir: Path) -> Any:
+    """Load tokenizer — try Rust tokenizers lib first, fall back to transformers."""
+    t0 = time.monotonic()
+
+    # Fast path: Rust tokenizers library (no transformers import)
+    tokenizer_json = tok_dir / "tokenizer.json"
+    if tokenizer_json.exists():
+        try:
+            from tokenizers import Tokenizer as RustTokenizer
+            rust_tok = RustTokenizer.from_file(str(tokenizer_json))
+            wrapper = _FastTokenizerWrapper(rust_tok, tok_dir)
+            log.info("Loaded tokenizer via Rust tokenizers lib (%.3fs)", time.monotonic() - t0)
+            return wrapper
+        except ImportError:
+            pass
+
+    # Fallback: transformers AutoTokenizer
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(str(tok_dir))
+    log.info("Loaded tokenizer via AutoTokenizer (%.3fs)", time.monotonic() - t0)
+    return tok
+
+
+class _FastTokenizerWrapper:
+    """Minimal wrapper around tokenizers.Tokenizer for generate() compat."""
+
+    def __init__(self, rust_tokenizer: Any, tok_dir: Path):
+        self._tok = rust_tokenizer
+        # Load special tokens from tokenizer_config.json
+        config_path = tok_dir / "tokenizer_config.json"
+        self._config: dict[str, Any] = {}
+        if config_path.exists():
+            with open(config_path) as f:
+                self._config = json.load(f)
+
+        # Handle eos_token_id that might be a dict or list
+        eos = self._config.get("eos_token_id")
+        if isinstance(eos, list):
+            eos = eos[0] if eos else None
+        elif isinstance(eos, dict):
+            eos = eos.get("content")
+        self.eos_token_id = eos
+        self.pad_token_id = self._config.get("pad_token_id", self.eos_token_id)
+
+    def __call__(self, text: str, return_tensors: str | None = None, **kwargs: Any) -> Any:
+        import torch
+        encoded = self._tok.encode(text)
+        ids = encoded.ids
+        mask = encoded.attention_mask
+        if return_tensors == "pt":
+            return {
+                "input_ids": torch.tensor([ids], dtype=torch.long),
+                "attention_mask": torch.tensor([mask], dtype=torch.long),
+            }
+        return {"input_ids": ids, "attention_mask": mask}
+
+    def decode(self, ids: Any, skip_special_tokens: bool = False) -> str:
+        import torch
+        if isinstance(ids, torch.Tensor):
+            ids = ids.tolist()
+        return self._tok.decode(ids, skip_special_tokens=skip_special_tokens)
+
+    def encode(self, text: str, **kwargs: Any) -> Any:
+        return self._tok.encode(text)
+
+
+def _load_tensors_mmap(
+    manifest: dict[str, Any],
+    snap_dir: Path,
+    torch: Any,
+) -> dict[str, Any]:
+    """Load all referenced tensors via mmap."""
     tensor_refs = manifest.get("tensor_refs", {})
 
-    # Group tensors by safetensors file for efficient loading
+    # Group by safetensors file
     file_to_tensors: dict[str, list[tuple[str, str]]] = {}
-    standalone_tensors: list[str] = []
+    standalone: list[str] = []
 
     for ref_key, ref_info in tensor_refs.items():
         sf_file = ref_info.get("safetensors_file")
@@ -531,11 +530,9 @@ def hydrate(
         if sf_file and sf_tensor:
             file_to_tensors.setdefault(sf_file, []).append((ref_key, sf_tensor))
         else:
-            standalone_tensors.append(ref_key)
+            standalone.append(ref_key)
 
-    # Load tensors from safetensors files (mmap, zero-copy)
-    loaded_tensors: dict[str, Any] = {}
-    t_mmap_start = time.monotonic()
+    loaded: dict[str, Any] = {}
 
     for sf_file, tensor_pairs in file_to_tensors.items():
         sf_path = Path(sf_file)
@@ -543,184 +540,125 @@ def hydrate(
             log.warning("Safetensors file not found: %s", sf_file)
             continue
 
-        # Try safetensors-streaming first (zero-copy Rust mmap)
+        # Try safetensors-streaming first (Rust mmap)
         try:
             import safetensors_streaming
             handle = safetensors_streaming.safe_open(str(sf_path), framework="pt", device="cpu")
             for ref_key, sf_tensor_name in tensor_pairs:
                 try:
-                    tensor = handle.get_tensor(sf_tensor_name)
-                    loaded_tensors[ref_key] = tensor
+                    loaded[ref_key] = handle.get_tensor(sf_tensor_name)
                 except Exception as e:
-                    log.warning("Failed to load tensor %s from %s: %s", sf_tensor_name, sf_file, e)
+                    log.warning("Failed to load %s: %s", sf_tensor_name, e)
             continue
         except ImportError:
             pass
 
-        # Fall back to standard safetensors
+        # Standard safetensors
         try:
             from safetensors.torch import load_file
             all_tensors = load_file(str(sf_path), device="cpu")
             for ref_key, sf_tensor_name in tensor_pairs:
                 if sf_tensor_name in all_tensors:
-                    loaded_tensors[ref_key] = all_tensors[sf_tensor_name]
-                else:
-                    log.warning("Tensor %s not found in %s", sf_tensor_name, sf_file)
+                    loaded[ref_key] = all_tensors[sf_tensor_name]
             continue
         except ImportError:
             pass
 
-        # Last resort: torch.load from the serialized tensor files
-        log.warning("No safetensors loader available for %s", sf_file)
+        log.warning("No safetensors loader for %s", sf_file)
 
-    # Load standalone (unmatched) tensors from serialized files
+    # Standalone (unmatched) tensors
     tensors_dir = snap_dir / "tensors"
-    for ref_key in standalone_tensors:
+    for ref_key in standalone:
         safe_name = ref_key.replace("/", "_").replace(".", "_") + ".pt"
         pt_path = tensors_dir / safe_name
         if pt_path.exists():
-            loaded_tensors[ref_key] = torch.load(pt_path, map_location="cpu", weights_only=True)
+            loaded[ref_key] = torch.load(pt_path, map_location="cpu", weights_only=True)
 
-    t_mmap = time.monotonic() - t_mmap_start
-    log.info("Tensors loaded via mmap (%.3fs, %d tensors)", t_mmap, len(loaded_tensors))
-
-    # 4. Reconstruct state: wire tensors back into Python objects
-    t_reconstruct_start = time.monotonic()
-    restored_state: dict[str, Any] = {}
-
-    for key, value in cleaned_state.items():
-        if isinstance(value, _ModulePlaceholder):
-            module = _reconstruct_module(value, key, loaded_tensors, device)
-            restored_state[key] = module
-        elif isinstance(value, _TensorPlaceholder):
-            tensor = loaded_tensors.get(key)
-            if tensor is not None:
-                if device:
-                    tensor = tensor.to(device)
-                restored_state[key] = tensor
-            else:
-                log.warning("Tensor %s not found in snapshot", key)
-                restored_state[key] = None
-        else:
-            restored_state[key] = value
-
-    t_reconstruct = time.monotonic() - t_reconstruct_start
-    elapsed = time.monotonic() - t0
-    log.info(
-        "Hydration complete (%.3fs total: %.3fs python + %.3fs tensors + %.3fs reconstruct)",
-        elapsed, t_python, t_mmap, t_reconstruct,
-    )
-
-    return restored_state
+    return loaded
 
 
-def _reconstruct_module(
-    placeholder: _ModulePlaceholder,
+def _reconstruct_module_from_config(
+    model_config: dict[str, Any],
     state_key: str,
     loaded_tensors: dict[str, Any],
     device: str | None,
+    torch: Any,
 ) -> Any:
-    """Reconstruct an nn.Module from its placeholder + tensor data."""
-    torch = _get_torch()
+    """Reconstruct an nn.Module from JSON config + mmap'd tensors."""
+    import importlib
 
-    config = placeholder.config
-    module = None
+    t0 = time.monotonic()
 
-    # Try to reconstruct from config (transformers-style)
-    if config and config.get("_type") == "transformers":
-        try:
-            import importlib
-            t_import = time.monotonic()
-            model_module = importlib.import_module(config["_module"])
-            model_class = getattr(model_module, config["_class"])
+    mc = model_config
+    if mc.get("_type") != "transformers":
+        log.warning("Unknown model type: %s", mc.get("_type"))
+        return None
 
-            config_module = importlib.import_module(config["config_module"])
-            config_class = getattr(config_module, config["config_class"])
-            t_import_done = time.monotonic()
+    try:
+        model_module = importlib.import_module(mc["_module"])
+        model_class = getattr(model_module, mc["_class"])
+        config_module = importlib.import_module(mc["config_module"])
+        config_class = getattr(config_module, mc["config_class"])
+    except Exception as e:
+        log.warning("Failed to import model class: %s", e)
+        return None
 
-            model_config = config_class.from_dict(config["config_dict"])
+    t_import = time.monotonic()
 
-            # Create model on meta device (zero memory allocation) then
-            # replace meta tensors with real data via load_state_dict(assign=True).
-            # This matches how from_pretrained works: 0.4s instead of 80s.
-            t_meta = time.monotonic()
-            with _no_init_weights():
-                with torch.device("meta"):
-                    module = model_class(model_config)
-            t_meta_done = time.monotonic()
+    try:
+        cfg = config_class.from_dict(mc["config_dict"])
+        with _no_init_weights():
+            with torch.device("meta"):
+                module = model_class(cfg)
+    except Exception as e:
+        log.warning("Failed to create model on meta device: %s", e)
+        return None
 
-            log.info(
-                "Reconstructed %s (import=%.2fs, meta_init=%.2fs)",
-                config["_class"], t_import_done - t_import, t_meta_done - t_meta,
-            )
-        except Exception as e:
-            log.warning("Failed to reconstruct from config: %s", e)
+    t_meta = time.monotonic()
 
-    # Fallback: try with no-init weights
-    if module is None:
-        try:
-            with _no_init_weights():
-                module = placeholder.module_class.__new__(placeholder.module_class)
-                if hasattr(module, "__init__"):
-                    torch.nn.Module.__init__(module)
-        except Exception as e:
-            log.warning("Failed to create empty module: %s", e)
-            return None
-
-    # Load state dict from mmap'd tensors
+    # Build state_dict from loaded tensors
+    prefix = f"{state_key}."
     state_dict = {}
-    for param_name in placeholder.tensor_keys:
-        ref_key = f"{state_key}.{param_name}"
-        tensor = loaded_tensors.get(ref_key)
-        if tensor is not None:
+    for ref_key, tensor in loaded_tensors.items():
+        if ref_key.startswith(prefix):
+            param_name = ref_key[len(prefix):]
             state_dict[param_name] = tensor
 
     if state_dict:
-        t_load = time.monotonic()
         try:
             module.load_state_dict(state_dict, strict=False, assign=True)
         except TypeError:
-            # older torch doesn't have assign=True
             module.load_state_dict(state_dict, strict=False)
-        t_load_done = time.monotonic()
 
-        # Re-tie weights (e.g., lm_head.weight = wte.weight in GPT-2)
         if hasattr(module, "tie_weights"):
             module.tie_weights()
 
-        log.info("load_state_dict: %.2fs (%d tensors)", t_load_done - t_load, len(state_dict))
+    t_load = time.monotonic()
 
-    # Materialize any remaining meta tensors (computed buffers like
-    # rotary_emb.inv_freq that aren't in state_dict/safetensors).
-    # These need to be recreated by calling the module's init logic
-    # just for the specific submodules that still have meta tensors.
-    t_mat = time.monotonic()
     _materialize_meta_tensors(module)
-    t_mat_done = time.monotonic()
-    if t_mat_done - t_mat > 0.01:
-        log.info("materialize_meta_tensors: %.2fs", t_mat_done - t_mat)
 
-    # Move to device if requested
     if device:
         module = module.to(device)
+
+    t_done = time.monotonic()
+    log.info(
+        "Reconstructed %s (import=%.2fs, meta=%.2fs, load_sd=%.2fs, materialize=%.2fs)",
+        mc["_class"], t_import - t0, t_meta - t_import,
+        t_load - t_meta, t_done - t_load,
+    )
 
     return module
 
 
 def _materialize_meta_tensors(module: Any) -> None:
-    """Replace remaining meta-device tensors with properly initialized CPU tensors.
-
-    After creating a model on meta device and loading state_dict, computed
-    buffers (like rotary embeddings' inv_freq) may still be meta tensors.
-    Re-instantiate the specific submodule classes to get correct values.
-    """
+    """Replace remaining meta-device tensors with properly initialized CPU tensors."""
     torch = _get_torch()
-    meta_submodules: list[tuple[str, Any, Any]] = []
+    meta_submodules: list[tuple[str, Any]] = []
 
     for name, submodule in module.named_modules():
         for buf_name, buf in submodule.named_buffers(recurse=False):
             if buf.device.type == "meta":
-                meta_submodules.append((name, submodule, module))
+                meta_submodules.append((name, submodule))
                 break
 
     if not meta_submodules:
@@ -728,22 +666,16 @@ def _materialize_meta_tensors(module: Any) -> None:
 
     log.info("Materializing %d submodules with meta tensors", len(meta_submodules))
 
-    for name, submodule, parent in meta_submodules:
-        # Re-instantiate the submodule class to get correctly computed buffers
+    for name, submodule in meta_submodules:
         submodule_class = type(submodule)
         try:
-            # Try to reconstruct from the submodule's config/args
-            # Most transformers submodules store their init args
             if hasattr(submodule, "config"):
                 new_sub = submodule_class(submodule.config)
             elif hasattr(submodule, "dim") and hasattr(submodule, "max_position_embeddings"):
-                # RotaryEmbedding pattern
                 new_sub = submodule_class(submodule.dim, submodule.max_position_embeddings)
             else:
-                # Generic: try calling to_empty to get CPU tensors
                 new_sub = submodule.to_empty(device="cpu")
 
-            # Replace the submodule in the parent
             if name:
                 parts = name.split(".")
                 target = module
@@ -752,7 +684,6 @@ def _materialize_meta_tensors(module: Any) -> None:
                 setattr(target, parts[-1], new_sub)
         except Exception as e:
             log.warning("Failed to materialize %s (%s): %s", name, submodule_class.__name__, e)
-            # Fallback: just allocate empty tensors
             for buf_name, buf in list(submodule.named_buffers(recurse=False)):
                 if buf.device.type == "meta":
                     new_buf = torch.empty(buf.shape, dtype=buf.dtype, device="cpu")
@@ -760,17 +691,80 @@ def _materialize_meta_tensors(module: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# V1 backward compat (cloudpickle-based snapshots)
+# ---------------------------------------------------------------------------
+
+class _ModulePlaceholder:
+    def __init__(self, module_class: type, config: dict[str, Any] | None, tensor_keys: list[str]):
+        self.module_class = module_class
+        self.config = config
+        self.tensor_keys = tensor_keys
+
+
+class _TensorPlaceholder:
+    def __init__(self, key: str):
+        self.key = key
+
+
+def _hydrate_v1(
+    snap_dir: Path,
+    manifest: dict[str, Any],
+    device: str | None,
+    verify_fingerprint: bool,
+    t0: float,
+) -> dict[str, Any]:
+    """Hydrate a v1 (cloudpickle-based) snapshot."""
+    import cloudpickle
+
+    if verify_fingerprint:
+        current_fp = _environment_fingerprint()
+        snap_fp = manifest.get("fingerprint", "")
+        if current_fp != snap_fp:
+            log.warning("Environment fingerprint mismatch (snapshot=%s, current=%s)", snap_fp, current_fp)
+
+    with open(snap_dir / "python_state.pkl", "rb") as f:
+        cleaned_state = cloudpickle.loads(f.read())
+    t_python = time.monotonic() - t0
+    log.info("Python state loaded (%.3fs)", t_python)
+
+    torch = _get_torch()
+    loaded_tensors = _load_tensors_mmap(manifest, snap_dir, torch)
+    t_mmap = time.monotonic() - t0 - t_python
+    log.info("Tensors loaded via mmap (%.3fs, %d tensors)", t_mmap, len(loaded_tensors))
+
+    restored_state: dict[str, Any] = {}
+    for key, value in cleaned_state.items():
+        if isinstance(value, _ModulePlaceholder):
+            if value.config and value.config.get("_type") == "transformers":
+                module = _reconstruct_module_from_config(
+                    value.config, key, loaded_tensors, device, torch,
+                )
+            else:
+                module = None
+            restored_state[key] = module
+        elif isinstance(value, _TensorPlaceholder):
+            tensor = loaded_tensors.get(key)
+            if tensor is not None and device:
+                tensor = tensor.to(device)
+            restored_state[key] = tensor
+        else:
+            restored_state[key] = value
+
+    elapsed = time.monotonic() - t0
+    log.info("Hydration complete (%.3fs)", elapsed)
+    return restored_state
+
+
+# ---------------------------------------------------------------------------
 # CLI helpers
 # ---------------------------------------------------------------------------
 
 def snapshot_exists(path: str | Path) -> bool:
-    """Check if a valid snapshot exists at the given path."""
     snap_dir = Path(path)
-    return (snap_dir / "manifest.json").exists() and (snap_dir / "python_state.pkl").exists()
+    return (snap_dir / "manifest.json").exists()
 
 
 def snapshot_info(path: str | Path) -> dict[str, Any]:
-    """Get metadata about a snapshot without loading it."""
     snap_dir = Path(path)
     with open(snap_dir / "manifest.json") as f:
         return json.load(f)
