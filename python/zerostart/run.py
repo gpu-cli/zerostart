@@ -667,6 +667,8 @@ def main() -> None:
     parser.add_argument("-r", "--requirements", help="Requirements file")
     parser.add_argument("-p", "--packages", action="append", help="Additional packages to install (repeatable: -p torch -p numpy)")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--accelerate", action="store_true", help="Enable transparent model loading acceleration (4x faster from_pretrained)")
+    parser.add_argument("--model-cache-dir", help="Model cache directory for --accelerate")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -674,6 +676,10 @@ def main() -> None:
         format="%(asctime)s.%(msecs)03d %(name)-10s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    if args.accelerate:
+        from zerostart.accelerate import accelerate
+        accelerate(cache_dir=args.model_cache_dir)
 
     if _is_script(args.target):
         sys.argv = [args.target] + args.target_args

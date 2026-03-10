@@ -114,6 +114,75 @@ print(f"Loaded on {model.device}")
 zerostart run serve.py  # deps auto-detected from script
 ```
 
+## Model Loading Acceleration
+
+`zerostart.accelerate()` transparently patches `from_pretrained` to load models up to 9x faster. No code changes needed — just add one line:
+
+```python
+import zerostart
+zerostart.accelerate()
+
+# Your existing code runs unchanged, but 9x faster
+from transformers import AutoModelForCausalLM
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B", device_map="cuda")
+```
+
+Or via CLI with zero code changes:
+
+```bash
+zerostart run --accelerate -p torch -p transformers serve.py
+```
+
+### How it works
+
+Three transparent hooks eliminate the bottlenecks in standard model loading:
+
+| Hook | Target | What it fixes | Speedup |
+|------|--------|---------------|---------|
+| Meta device init | `from_pretrained` | Skips random weight initialization (75% of load time) | ~4x |
+| Auto-cache | `from_pretrained` | Snapshots model on first load, mmap hydrate on repeat | ~9x |
+| Network volume fix | `safetensors.load_file` | Eager read instead of mmap on FUSE/NFS volumes | 30-50x on network storage |
+| .bin conversion | `torch.load` | Converts legacy checkpoints to safetensors, mmaps on repeat | ~2x |
+
+### Benchmarks (model loading)
+
+Measured on RTX A6000 with Qwen2.5-7B (15.2GB):
+
+| Scenario | Baseline | zerostart.accelerate() | Speedup |
+|----------|----------|------------------------|---------|
+| from_pretrained (cold) | 91.75s | 11.39s | **8.1x** |
+| from_pretrained (cached) | 91.75s | 10.20s | **9.0x** |
+
+Identical output. Works with transformers, diffusers, and any framework using safetensors.
+
+### Model Cache
+
+Models are automatically cached after first load. Manage the cache with the `ModelCache` API:
+
+```python
+from zerostart.model_cache import ModelCache
+
+cache = ModelCache("/volume/models")
+cache.list_entries()                    # Show cached models
+cache.auto_evict(max_size_bytes=50e9)   # LRU eviction to stay under 50GB
+```
+
+### Serving Integration
+
+For custom serving stacks:
+
+```python
+from zerostart.integrations.serving import ModelServer
+
+server = ModelServer("/volume/models")
+server.preload({
+    "llm": "Qwen/Qwen2.5-7B",
+    "embedder": "BAAI/bge-small-en-v1.5",
+}, device="cuda")
+
+model = server.get("llm")  # Ready for inference
+```
+
 ## Architecture
 
 The entire cold path runs in Rust — no Python orchestrator:

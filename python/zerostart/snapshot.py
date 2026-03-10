@@ -414,12 +414,13 @@ def hydrate(
         restored_state[tok_key] = _load_tokenizer(tok_dir)
     t_tok = time.monotonic()
 
-    # 3. Load tensors via mmap
+    # 3. Load tensors via mmap (directly to target device if possible)
     torch = _get_torch()
-    loaded_tensors = _load_tensors_mmap(manifest, snap_dir, torch)
+    tensor_device = device or "cpu"
+    loaded_tensors = _load_tensors_mmap(manifest, snap_dir, torch, tensor_device)
     t_mmap = time.monotonic()
 
-    # 4. Reconstruct models
+    # 4. Reconstruct models (tensors already on target device)
     for model_key, model_config in manifest.get("model_configs", {}).items():
         module = _reconstruct_module_from_config(
             model_config, model_key, loaded_tensors, device, torch,
@@ -516,8 +517,9 @@ def _load_tensors_mmap(
     manifest: dict[str, Any],
     snap_dir: Path,
     torch: Any,
+    device: str = "cpu",
 ) -> dict[str, Any]:
-    """Load all referenced tensors via mmap."""
+    """Load all referenced tensors via mmap, directly to target device."""
     tensor_refs = manifest.get("tensor_refs", {})
 
     # Group by safetensors file
@@ -543,7 +545,7 @@ def _load_tensors_mmap(
         # Try safetensors-streaming first (Rust mmap)
         try:
             import safetensors_streaming
-            handle = safetensors_streaming.safe_open(str(sf_path), framework="pt", device="cpu")
+            handle = safetensors_streaming.safe_open(str(sf_path), framework="pt", device=device)
             for ref_key, sf_tensor_name in tensor_pairs:
                 try:
                     loaded[ref_key] = handle.get_tensor(sf_tensor_name)
@@ -553,10 +555,10 @@ def _load_tensors_mmap(
         except ImportError:
             pass
 
-        # Standard safetensors
+        # Standard safetensors — load directly to target device
         try:
             from safetensors.torch import load_file
-            all_tensors = load_file(str(sf_path), device="cpu")
+            all_tensors = load_file(str(sf_path), device=device)
             for ref_key, sf_tensor_name in tensor_pairs:
                 if sf_tensor_name in all_tensors:
                     loaded[ref_key] = all_tensors[sf_tensor_name]
@@ -572,7 +574,7 @@ def _load_tensors_mmap(
         safe_name = ref_key.replace("/", "_").replace(".", "_") + ".pt"
         pt_path = tensors_dir / safe_name
         if pt_path.exists():
-            loaded[ref_key] = torch.load(pt_path, map_location="cpu", weights_only=True)
+            loaded[ref_key] = torch.load(pt_path, map_location=device, weights_only=True)
 
     return loaded
 
