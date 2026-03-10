@@ -204,24 +204,57 @@ def _find_safetensors_for_model(module: Any) -> list[Path]:
 
 def _find_hf_cache_dir(model_id: str) -> Path | None:
     """Find the HF hub cache directory for a model."""
-    hf_home = Path(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
-    hub_dir = hf_home / "hub"
-
-    # HF cache structure: hub/models--org--name/snapshots/<hash>/
     safe_id = model_id.replace("/", "--")
-    model_dir = hub_dir / f"models--{safe_id}"
+    model_subdir = f"models--{safe_id}"
 
-    if not model_dir.is_dir():
-        return None
+    # Check multiple possible HF cache locations in order of priority:
+    # 1. huggingface_hub constants (most reliable — reads all HF env vars)
+    # 2. HF_HUB_CACHE env var
+    # 3. HF_HOME env var + /hub
+    # 4. Default ~/.cache/huggingface/hub
+    candidates: list[Path] = []
 
-    # Find the latest snapshot
-    snapshots = model_dir / "snapshots"
-    if not snapshots.is_dir():
-        return None
+    try:
+        from huggingface_hub import constants
+        candidates.append(Path(constants.HF_HUB_CACHE))
+    except ImportError:
+        pass
 
-    # Get the most recent snapshot directory
-    snap_dirs = sorted(snapshots.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-    return snap_dirs[0] if snap_dirs else None
+    if hf_hub_cache := os.environ.get("HF_HUB_CACHE"):
+        candidates.append(Path(hf_hub_cache))
+
+    if hf_home := os.environ.get("HF_HOME"):
+        candidates.append(Path(hf_home) / "hub")
+
+    candidates.append(Path(os.path.expanduser("~/.cache/huggingface/hub")))
+
+    # Dedupe preserving order
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for c in candidates:
+        key = str(c)
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+
+    for hub_dir in unique:
+        model_dir = hub_dir / model_subdir
+        if not model_dir.is_dir():
+            continue
+
+        snapshots = model_dir / "snapshots"
+        if not snapshots.is_dir():
+            continue
+
+        snap_dirs = sorted(snapshots.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        if snap_dirs:
+            result = snap_dirs[0]
+            sf_count = len(list(result.glob("*.safetensors")))
+            log.info("Found HF cache for %s at %s (%d safetensors files)", model_id, result, sf_count)
+            return result
+
+    log.warning("Could not find HF cache for %s in %s", model_id, [str(c) for c in unique])
+    return None
 
 
 def _build_tensor_to_file_map(
@@ -552,6 +585,7 @@ def hydrate(
     log.info("Tensors loaded via mmap (%.3fs, %d tensors)", t_mmap, len(loaded_tensors))
 
     # 4. Reconstruct state: wire tensors back into Python objects
+    t_reconstruct_start = time.monotonic()
     restored_state: dict[str, Any] = {}
 
     for key, value in cleaned_state.items():
@@ -570,10 +604,11 @@ def hydrate(
         else:
             restored_state[key] = value
 
+    t_reconstruct = time.monotonic() - t_reconstruct_start
     elapsed = time.monotonic() - t0
     log.info(
-        "Hydration complete (%.3fs total: %.3fs python + %.3fs tensors)",
-        elapsed, t_python, t_mmap,
+        "Hydration complete (%.3fs total: %.3fs python + %.3fs tensors + %.3fs reconstruct)",
+        elapsed, t_python, t_mmap, t_reconstruct,
     )
 
     return restored_state
@@ -595,22 +630,29 @@ def _reconstruct_module(
     if config and config.get("_type") == "transformers":
         try:
             import importlib
+            t_import = time.monotonic()
             model_module = importlib.import_module(config["_module"])
             model_class = getattr(model_module, config["_class"])
 
             config_module = importlib.import_module(config["config_module"])
             config_class = getattr(config_module, config["config_class"])
+            t_import_done = time.monotonic()
 
             model_config = config_class.from_dict(config["config_dict"])
 
             # Create model on meta device (zero memory allocation) then
             # replace meta tensors with real data via load_state_dict(assign=True).
             # This matches how from_pretrained works: 0.4s instead of 80s.
+            t_meta = time.monotonic()
             with _no_init_weights():
                 with torch.device("meta"):
                     module = model_class(model_config)
+            t_meta_done = time.monotonic()
 
-            log.info("Reconstructed %s from config (meta device)", config["_class"])
+            log.info(
+                "Reconstructed %s (import=%.2fs, meta_init=%.2fs)",
+                config["_class"], t_import_done - t_import, t_meta_done - t_meta,
+            )
         except Exception as e:
             log.warning("Failed to reconstruct from config: %s", e)
 
@@ -634,21 +676,29 @@ def _reconstruct_module(
             state_dict[param_name] = tensor
 
     if state_dict:
+        t_load = time.monotonic()
         try:
             module.load_state_dict(state_dict, strict=False, assign=True)
         except TypeError:
             # older torch doesn't have assign=True
             module.load_state_dict(state_dict, strict=False)
+        t_load_done = time.monotonic()
 
         # Re-tie weights (e.g., lm_head.weight = wte.weight in GPT-2)
         if hasattr(module, "tie_weights"):
             module.tie_weights()
 
+        log.info("load_state_dict: %.2fs (%d tensors)", t_load_done - t_load, len(state_dict))
+
     # Materialize any remaining meta tensors (computed buffers like
     # rotary_emb.inv_freq that aren't in state_dict/safetensors).
     # These need to be recreated by calling the module's init logic
     # just for the specific submodules that still have meta tensors.
+    t_mat = time.monotonic()
     _materialize_meta_tensors(module)
+    t_mat_done = time.monotonic()
+    if t_mat_done - t_mat > 0.01:
+        log.info("materialize_meta_tensors: %.2fs", t_mat_done - t_mat)
 
     # Move to device if requested
     if device:

@@ -6,7 +6,7 @@
     { "type": "RTX A6000" }
   ],
   "min_vram": 24,
-  "include": ["bin/"],
+  "include": ["bin/", "tests/", "python/"],
   "outputs": ["benches/results/"],
   "environment": {
     "system": {
