@@ -103,6 +103,7 @@ def _environment_fingerprint() -> str:
 def _extract_model_config(module: Any) -> dict[str, Any] | None:
     if hasattr(module, "config"):
         config = module.config
+        # transformers: config has to_dict (PretrainedConfig)
         if hasattr(config, "to_dict"):
             return {
                 "_type": "transformers",
@@ -111,6 +112,14 @@ def _extract_model_config(module: Any) -> dict[str, Any] | None:
                 "config_class": type(config).__name__,
                 "config_module": type(config).__module__,
                 "config_dict": config.to_dict(),
+            }
+        # diffusers: config is a plain dict
+        if isinstance(config, dict):
+            return {
+                "_type": "diffusers",
+                "_class": type(module).__name__,
+                "_module": type(module).__module__,
+                "config_dict": config,
             }
     return None
 
@@ -592,15 +601,17 @@ def _reconstruct_module_from_config(
     t0 = time.monotonic()
 
     mc = model_config
-    if mc.get("_type") != "transformers":
-        log.warning("Unknown model type: %s", mc.get("_type"))
+    model_type = mc.get("_type")
+    if model_type not in ("transformers", "diffusers"):
+        log.warning("Unknown model type: %s", model_type)
         return None
 
     try:
         model_module = importlib.import_module(mc["_module"])
         model_class = getattr(model_module, mc["_class"])
-        config_module = importlib.import_module(mc["config_module"])
-        config_class = getattr(config_module, mc["config_class"])
+        if model_type == "transformers":
+            config_module = importlib.import_module(mc["config_module"])
+            config_class = getattr(config_module, mc["config_class"])
     except Exception as e:
         log.warning("Failed to import model class: %s", e)
         return None
@@ -608,10 +619,16 @@ def _reconstruct_module_from_config(
     t_import = time.monotonic()
 
     try:
-        cfg = config_class.from_dict(mc["config_dict"])
-        with _no_init_weights():
-            with torch.device("meta"):
-                module = model_class(cfg)
+        if model_type == "transformers":
+            cfg = config_class.from_dict(mc["config_dict"])
+            with _no_init_weights():
+                with torch.device("meta"):
+                    module = model_class(cfg)
+        else:
+            # diffusers: config is a plain dict passed as kwargs
+            with _no_init_weights():
+                with torch.device("meta"):
+                    module = model_class(**mc["config_dict"])
     except Exception as e:
         log.warning("Failed to create model on meta device: %s", e)
         return None
