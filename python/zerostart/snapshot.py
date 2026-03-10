@@ -644,11 +644,69 @@ def _reconstruct_module(
         if hasattr(module, "tie_weights"):
             module.tie_weights()
 
+    # Materialize any remaining meta tensors (computed buffers like
+    # rotary_emb.inv_freq that aren't in state_dict/safetensors).
+    # These need to be recreated by calling the module's init logic
+    # just for the specific submodules that still have meta tensors.
+    _materialize_meta_tensors(module)
+
     # Move to device if requested
     if device:
         module = module.to(device)
 
     return module
+
+
+def _materialize_meta_tensors(module: Any) -> None:
+    """Replace remaining meta-device tensors with properly initialized CPU tensors.
+
+    After creating a model on meta device and loading state_dict, computed
+    buffers (like rotary embeddings' inv_freq) may still be meta tensors.
+    Re-instantiate the specific submodule classes to get correct values.
+    """
+    torch = _get_torch()
+    meta_submodules: list[tuple[str, Any, Any]] = []
+
+    for name, submodule in module.named_modules():
+        for buf_name, buf in submodule.named_buffers(recurse=False):
+            if buf.device.type == "meta":
+                meta_submodules.append((name, submodule, module))
+                break
+
+    if not meta_submodules:
+        return
+
+    log.info("Materializing %d submodules with meta tensors", len(meta_submodules))
+
+    for name, submodule, parent in meta_submodules:
+        # Re-instantiate the submodule class to get correctly computed buffers
+        submodule_class = type(submodule)
+        try:
+            # Try to reconstruct from the submodule's config/args
+            # Most transformers submodules store their init args
+            if hasattr(submodule, "config"):
+                new_sub = submodule_class(submodule.config)
+            elif hasattr(submodule, "dim") and hasattr(submodule, "max_position_embeddings"):
+                # RotaryEmbedding pattern
+                new_sub = submodule_class(submodule.dim, submodule.max_position_embeddings)
+            else:
+                # Generic: try calling to_empty to get CPU tensors
+                new_sub = submodule.to_empty(device="cpu")
+
+            # Replace the submodule in the parent
+            if name:
+                parts = name.split(".")
+                target = module
+                for part in parts[:-1]:
+                    target = getattr(target, part)
+                setattr(target, parts[-1], new_sub)
+        except Exception as e:
+            log.warning("Failed to materialize %s (%s): %s", name, submodule_class.__name__, e)
+            # Fallback: just allocate empty tensors
+            for buf_name, buf in list(submodule.named_buffers(recurse=False)):
+                if buf.device.type == "meta":
+                    new_buf = torch.empty(buf.shape, dtype=buf.dtype, device="cpu")
+                    submodule.register_buffer(buf_name, new_buf)
 
 
 # ---------------------------------------------------------------------------
