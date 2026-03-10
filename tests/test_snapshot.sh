@@ -11,9 +11,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 export PYTHONPATH="$PROJECT_DIR/python:${PYTHONPATH:-}"
 
-# Use system torch/transformers (pre-installed on RunPod) — saves 7GB disk
-# Only install cloudpickle (tiny)
-pip install -q cloudpickle 2>/dev/null
+# Install deps — use system torch if available, otherwise install
+pip install -q cloudpickle transformers accelerate 2>/dev/null
 
 cat > /tmp/test_snapshot_real.py << 'PYEOF'
 """Snapshot/hydrate benchmark: hydrate vs from_pretrained on a real model.
