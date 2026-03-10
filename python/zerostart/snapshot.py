@@ -548,9 +548,6 @@ def _reconstruct_module(
     module = None
 
     # Try to reconstruct from config (transformers-style)
-    # Use normal init (not init_empty_weights) so tied weights, attention
-    # masks, and other buffers are properly set up. The random init cost
-    # is small (~0.1s) and load_state_dict(assign=True) replaces weights.
     if config and config.get("_type") == "transformers":
         try:
             import importlib
@@ -561,6 +558,9 @@ def _reconstruct_module(
             config_class = getattr(config_module, config["config_class"])
 
             model_config = config_class.from_dict(config["config_dict"])
+
+            # Normal init handles tied weights, attention masks, buffers.
+            # Random weight init is ~0.1s, dwarfed by import time.
             module = model_class(model_config)
 
             log.info("Reconstructed %s from config", config["_class"])
@@ -591,6 +591,10 @@ def _reconstruct_module(
         except TypeError:
             # older torch doesn't have assign=True
             module.load_state_dict(state_dict, strict=False)
+
+        # Re-tie weights (e.g., lm_head.weight = wte.weight in GPT-2)
+        if hasattr(module, "tie_weights"):
+            module.tie_weights()
 
     # Move to device if requested
     if device:
