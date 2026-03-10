@@ -55,7 +55,7 @@ log.info("Model loaded: %.2fs", t3 - t2)
 # Quick inference to verify model works
 inputs = tokenizer("Hello, world!", return_tensors="pt")
 with torch.no_grad():
-    outputs = model.generate(**inputs, max_new_tokens=20)
+    outputs = model.generate(**inputs, max_new_tokens=20, do_sample=False)
 result_normal = tokenizer.decode(outputs[0], skip_special_tokens=True)
 t4 = time.monotonic()
 log.info("Inference: %.2fs", t4 - t3)
@@ -110,7 +110,7 @@ tokenizer2 = restored["tokenizer"]
 # Verify restored model produces same output
 inputs2 = tokenizer2("Hello, world!", return_tensors="pt")
 with torch.no_grad():
-    outputs2 = model2.generate(**inputs2, max_new_tokens=20)
+    outputs2 = model2.generate(**inputs2, max_new_tokens=20, do_sample=False)
 result_hydrated = tokenizer2.decode(outputs2[0], skip_special_tokens=True)
 t9 = time.monotonic()
 log.info("Inference after hydrate: %.2fs", t9 - t8)
