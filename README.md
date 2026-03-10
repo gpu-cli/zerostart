@@ -78,6 +78,19 @@ No resolution, no environment setup, no uv involved.
 
 CUDA libraries (nvidia-cublas, nvidia-cudnn, nvidia-nccl, etc.) are ~6GB and identical across torch, vllm, and diffusers environments. zerostart caches extracted wheels at `$ZEROSTART_CACHE/shared_wheels/` and hardlinks them into new environments — so the second torch-based environment skips downloading those 6GB entirely.
 
+## Install
+
+```bash
+# Rust binary (fast wheel installation + streaming)
+curl -fsSL https://github.com/gpu-cli/zerostart/releases/latest/download/zerostart-linux-x86_64 \
+  -o /usr/local/bin/zerostart && chmod +x /usr/local/bin/zerostart
+
+# Python SDK (model acceleration, integrations)
+pip install zerostart
+```
+
+Requires Linux + Python 3.10+ + `uv` (pre-installed on most GPU containers).
+
 ## Quick Start
 
 ```bash
@@ -141,8 +154,10 @@ Three transparent hooks eliminate the bottlenecks in standard model loading:
 |------|--------|---------------|---------|
 | Meta device init | `from_pretrained` | Skips random weight initialization (75% of load time) | ~4x |
 | Auto-cache | `from_pretrained` | Snapshots model on first load, mmap hydrate on repeat | ~9x |
-| Network volume fix | `safetensors.load_file` | Eager read instead of mmap on FUSE/NFS volumes | 30-50x on network storage |
+| Network volume fix | `safetensors.load_file` | Eager read instead of mmap on NFS/JuiceFS (cold reads) | situational* |
 | .bin conversion | `torch.load` | Converts legacy checkpoints to safetensors, mmaps on repeat | ~2x |
+
+*Network volume fix only helps on cold reads from network-backed filesystems where mmap page faults trigger network round-trips. On FUSE with warm page cache (most container providers), mmap is already fast.
 
 ### Benchmarks (model loading)
 
@@ -236,6 +251,19 @@ Performance knobs via environment variables:
 # Crank up parallelism on a fast network
 ZS_PARALLEL_DOWNLOADS=32 ZS_CHUNK_MB=32 zerostart run -v -p torch test.py
 ```
+
+## When to Use It
+
+**Use zerostart when:**
+- Deploying large GPU packages (torch, vllm, diffusers) on container providers
+- Cold starts matter — spot instances, CI/CD, autoscaling
+- Loading large models (7B+) repeatedly — `accelerate()` gives 8-9x speedup
+- You want warm starts under 4 seconds for 177-package stacks
+
+**Don't bother when:**
+- Small packages (ruff, black, httpie) — uvx is fast enough, zerostart adds ~0.5s overhead
+- One-off scripts that don't repeat — cold start optimization doesn't pay off
+- You're already on local NVMe with models in page cache — mmap is already fast
 
 ## Requirements
 
