@@ -548,6 +548,9 @@ def _reconstruct_module(
     module = None
 
     # Try to reconstruct from config (transformers-style)
+    # Use normal init (not init_empty_weights) so tied weights, attention
+    # masks, and other buffers are properly set up. The random init cost
+    # is small (~0.1s) and load_state_dict(assign=True) replaces weights.
     if config and config.get("_type") == "transformers":
         try:
             import importlib
@@ -558,25 +561,18 @@ def _reconstruct_module(
             config_class = getattr(config_module, config["config_class"])
 
             model_config = config_class.from_dict(config["config_dict"])
-
-            # Initialize with empty weights (no random init overhead)
-            from accelerate import init_empty_weights
-            with init_empty_weights():
-                module = model_class(model_config)
+            module = model_class(model_config)
 
             log.info("Reconstructed %s from config", config["_class"])
         except Exception as e:
             log.warning("Failed to reconstruct from config: %s", e)
 
-    # Fallback: try cloudpickle'd module class with empty init
+    # Fallback: try cloudpickle'd module class with basic init
     if module is None:
         try:
-            from accelerate import init_empty_weights
-            with init_empty_weights():
-                module = placeholder.module_class.__new__(placeholder.module_class)
-                if hasattr(module, "__init__"):
-                    # Skip init — we'll load state dict directly
-                    torch.nn.Module.__init__(module)
+            module = placeholder.module_class.__new__(placeholder.module_class)
+            if hasattr(module, "__init__"):
+                torch.nn.Module.__init__(module)
         except Exception as e:
             log.warning("Failed to create empty module: %s", e)
             return None
