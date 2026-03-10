@@ -29,5 +29,8 @@ Issues = "https://github.com/gpu-cli/zerostart/issues"
 [project.scripts]
 zerostart = "zerostart.run:main"
 
+[project.entry-points."vllm.general_plugins"]
+zerostart = "zerostart.integrations.vllm:register_plugin"
+
 [tool.setuptools.packages.find]
 where = ["."]

@@ -21,53 +21,65 @@ pip uninstall -y torchvision 2>/dev/null || true
 
 echo "--- Installing vLLM ---"
 pip install -q vllm 2>&1 | tail -5
+
+# Install zerostart in editable mode so entry_points register
+cd "$PROJECT_DIR/python" && pip install -q -e . 2>&1 | tail -3
+cd "$PROJECT_DIR"
 echo ""
 
 echo "============================================================"
-echo "TEST 1: Verify registration works"
+echo "TEST 1: Verify registration + plugin system"
 echo "============================================================"
 
 python3 << 'PYEOF'
 import sys, os
-sys.path.insert(0, os.environ.get("PYTHONPATH", "").split(":")[0])
 
+# Test 1a: Manual registration
 from zerostart.integrations.vllm import register, ZerostartModelLoader
 register()
 
-# Verify registration
 try:
     from vllm.model_executor.model_loader import get_model_loader
     from vllm.config.load import LoadConfig
     load_config = LoadConfig(load_format="zerostart")
     loader = get_model_loader(load_config)
-    print(f"✓ Registered: {type(loader).__name__}")
     assert type(loader).__name__ == "ZerostartModelLoader"
-    print("✓ Registration verified")
+    print("✓ Manual registration works")
 except Exception as e:
-    print(f"Registration test: {e}")
-    # Try alternate verification
-    try:
-        import vllm.model_executor.model_loader as ml
-        registry = getattr(ml, "_LOAD_FORMAT_TO_MODEL_LOADER", {})
-        if "zerostart" in registry:
-            print(f"✓ Found in registry: {registry['zerostart']}")
-        else:
-            print(f"✗ Not in registry. Keys: {list(registry.keys())}")
-    except Exception as e2:
-        print(f"✗ Could not verify: {e2}")
+    print(f"✗ Manual registration: {e}")
+
+# Test 1b: Plugin entry point
+from zerostart.integrations.vllm import register_plugin
+register_plugin()
+print("✓ Plugin entry point works")
+
+# Test 1c: Verify it subclasses DefaultModelLoader
+try:
+    from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+    assert issubclass(ZerostartModelLoader, DefaultModelLoader)
+    print("✓ Subclasses DefaultModelLoader")
+except Exception as e:
+    print(f"  Subclass check: {e}")
+
+# Test 1d: Network volume detection
+from zerostart.integrations.vllm import _is_network_volume
+# /gpu-cli-workspaces is typically an overlay on RunPod
+result = _is_network_volume("/gpu-cli-workspaces")
+print(f"  /gpu-cli-workspaces is network volume: {result}")
+result2 = _is_network_volume("/tmp")
+print(f"  /tmp is network volume: {result2}")
 PYEOF
 
 echo ""
 echo "============================================================"
-echo "TEST 2: Baseline vLLM serve (standard loading)"
+echo "TEST 2: Baseline vLLM (standard loading)"
 echo "============================================================"
 
 python3 << PYEOF
 import subprocess, sys, os, time
 
 script = """
-import time, os, logging
-logging.basicConfig(level=logging.INFO, format="%(name)-20s %(message)s")
+import time, os
 t0 = time.monotonic()
 
 from vllm import LLM, SamplingParams
@@ -87,7 +99,7 @@ print(f"RESULT: {result}")
 print(f"TIME import={t_import-t0:.2f}s load={t_load-t_import:.2f}s generate={t_gen-t_load:.2f}s total={t_gen-t0:.2f}s")
 """
 
-script_path = "$BENCH_DIR/bench_vllm_baseline.py"
+script_path = "$BENCH_DIR/bench_baseline.py"
 with open(script_path, "w") as f:
     f.write(script)
 
@@ -105,7 +117,7 @@ PYEOF
 
 echo ""
 echo "============================================================"
-echo "TEST 3: vLLM with zerostart.accelerate() (transparent hook)"
+echo "TEST 3: vLLM --load-format zerostart (subprocess loader)"
 echo "============================================================"
 
 python3 << PYEOF
@@ -116,16 +128,16 @@ import time, os, logging
 logging.basicConfig(level=logging.INFO, format="%(name)-20s %(message)s")
 t0 = time.monotonic()
 
-import zerostart
-zerostart.accelerate(cache_dir="$BENCH_DIR/model-cache")
-t_accel = time.monotonic()
+# Register before creating LLM — plugin would do this automatically
+from zerostart.integrations.vllm import register
+register()
 
 from vllm import LLM, SamplingParams
 
 MODEL_ID = "$MODEL_ID"
 t_import = time.monotonic()
 
-llm = LLM(model=MODEL_ID, dtype="bfloat16", gpu_memory_utilization=0.8)
+llm = LLM(model=MODEL_ID, dtype="bfloat16", gpu_memory_utilization=0.8, load_format="zerostart")
 t_load = time.monotonic()
 
 params = SamplingParams(max_tokens=20, temperature=0)
@@ -134,10 +146,10 @@ result = outputs[0].outputs[0].text
 t_gen = time.monotonic()
 
 print(f"RESULT: {result}")
-print(f"TIME accel={t_accel-t0:.2f}s import={t_import-t_accel:.2f}s load={t_load-t_import:.2f}s generate={t_gen-t_load:.2f}s total={t_gen-t0:.2f}s")
+print(f"TIME import={t_import-t0:.2f}s load={t_load-t_import:.2f}s generate={t_gen-t_load:.2f}s total={t_gen-t0:.2f}s")
 """
 
-script_path = "$BENCH_DIR/bench_vllm_accel.py"
+script_path = "$BENCH_DIR/bench_zs_loader.py"
 with open(script_path, "w") as f:
     f.write(script)
 
@@ -156,7 +168,7 @@ PYEOF
 
 echo ""
 echo "============================================================"
-echo "TEST 4: vLLM with accelerate() — second run (cache hit)"
+echo "TEST 4: vLLM --load-format zerostart (second run)"
 echo "============================================================"
 
 python3 << PYEOF
@@ -167,16 +179,15 @@ import time, os, logging
 logging.basicConfig(level=logging.INFO, format="%(name)-20s %(message)s")
 t0 = time.monotonic()
 
-import zerostart
-zerostart.accelerate(cache_dir="$BENCH_DIR/model-cache")
-t_accel = time.monotonic()
+from zerostart.integrations.vllm import register
+register()
 
 from vllm import LLM, SamplingParams
 
 MODEL_ID = "$MODEL_ID"
 t_import = time.monotonic()
 
-llm = LLM(model=MODEL_ID, dtype="bfloat16", gpu_memory_utilization=0.8)
+llm = LLM(model=MODEL_ID, dtype="bfloat16", gpu_memory_utilization=0.8, load_format="zerostart")
 t_load = time.monotonic()
 
 params = SamplingParams(max_tokens=20, temperature=0)
@@ -185,10 +196,10 @@ result = outputs[0].outputs[0].text
 t_gen = time.monotonic()
 
 print(f"RESULT: {result}")
-print(f"TIME accel={t_accel-t0:.2f}s import={t_import-t_accel:.2f}s load={t_load-t_import:.2f}s generate={t_gen-t_load:.2f}s total={t_gen-t0:.2f}s")
+print(f"TIME import={t_import-t0:.2f}s load={t_load-t_import:.2f}s generate={t_gen-t_load:.2f}s total={t_gen-t0:.2f}s")
 """
 
-script_path = "$BENCH_DIR/bench_vllm_cached.py"
+script_path = "$BENCH_DIR/bench_zs_loader2.py"
 with open(script_path, "w") as f:
     f.write(script)
 
