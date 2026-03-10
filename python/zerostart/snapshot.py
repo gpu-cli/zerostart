@@ -39,6 +39,50 @@ log = logging.getLogger("zerostart.snapshot")
 
 
 # ---------------------------------------------------------------------------
+# No-init weights context manager
+# ---------------------------------------------------------------------------
+
+class _no_init_weights:
+    """Context manager that disables weight initialization in torch.nn.
+
+    Patches torch.nn.init functions to be no-ops, so model creation
+    allocates tensors but doesn't fill them with random data. This is
+    how transformers' from_pretrained works internally — saves ~80s for
+    a 7B model since we load real weights immediately after.
+    """
+
+    def __init__(self) -> None:
+        self._originals: dict[str, Any] = {}
+
+    def __enter__(self) -> None:
+        import torch.nn.init as init
+
+        # Patch all init functions to be no-ops
+        for name in dir(init):
+            fn = getattr(init, name)
+            if callable(fn) and not name.startswith("_"):
+                self._originals[name] = fn
+                setattr(init, name, lambda *args, **kwargs: None)
+
+        # Also patch nn.Module.reset_parameters if it exists
+        import torch.nn as nn
+        if hasattr(nn.Module, "reset_parameters"):
+            self._originals["Module.reset_parameters"] = nn.Module.reset_parameters
+            nn.Module.reset_parameters = lambda self: None
+
+    def __exit__(self, *args: object) -> None:
+        import torch.nn.init as init
+        import torch.nn as nn
+
+        for name, fn in self._originals.items():
+            if name == "Module.reset_parameters":
+                nn.Module.reset_parameters = fn
+            else:
+                setattr(init, name, fn)
+        self._originals.clear()
+
+
+# ---------------------------------------------------------------------------
 # Tensor reference extraction
 # ---------------------------------------------------------------------------
 
@@ -559,20 +603,23 @@ def _reconstruct_module(
 
             model_config = config_class.from_dict(config["config_dict"])
 
-            # Normal init handles tied weights, attention masks, buffers.
-            # Random weight init is ~0.1s, dwarfed by import time.
-            module = model_class(model_config)
+            # Skip random weight initialization — we're about to replace all
+            # weights from safetensors anyway. This is how from_pretrained does
+            # it internally, saving ~80s for a 7B model.
+            with _no_init_weights():
+                module = model_class(model_config)
 
-            log.info("Reconstructed %s from config", config["_class"])
+            log.info("Reconstructed %s from config (no-init)", config["_class"])
         except Exception as e:
             log.warning("Failed to reconstruct from config: %s", e)
 
-    # Fallback: try cloudpickle'd module class with basic init
+    # Fallback: try with no-init weights
     if module is None:
         try:
-            module = placeholder.module_class.__new__(placeholder.module_class)
-            if hasattr(module, "__init__"):
-                torch.nn.Module.__init__(module)
+            with _no_init_weights():
+                module = placeholder.module_class.__new__(placeholder.module_class)
+                if hasattr(module, "__init__"):
+                    torch.nn.Module.__init__(module)
         except Exception as e:
             log.warning("Failed to create empty module: %s", e)
             return None
