@@ -163,6 +163,9 @@ rm -rf "$ZEROSTART_CACHE"
 # Remove system torchvision that conflicts with our torch version
 pip uninstall -y torchvision 2>/dev/null || true
 
+# Add zerostart Python SDK to PYTHONPATH so it's importable in the zerostart-managed venv
+export PYTHONPATH="$PROJECT_DIR/python:${PYTHONPATH:-}"
+
 $ZS run -v -p torch -p transformers -p accelerate -p cloudpickle /tmp/test_snapshot.py 2>&1
 echo ""
 echo "Exit: $?"
