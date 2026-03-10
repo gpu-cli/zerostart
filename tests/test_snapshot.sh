@@ -48,7 +48,7 @@ tokenizer = AutoTokenizer.from_pretrained(model_id)
 t2 = time.monotonic()
 log.info("Tokenizer loaded: %.2fs", t2 - t1)
 
-model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
+model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32)
 t3 = time.monotonic()
 log.info("Model loaded: %.2fs", t3 - t2)
 
@@ -159,6 +159,9 @@ echo "Installing test dependencies..."
 export ZEROSTART_CACHE="/tmp/.zs-snap-test"
 export ZS_NO_SHARED_CACHE=1
 rm -rf "$ZEROSTART_CACHE"
+
+# Remove system torchvision that conflicts with our torch version
+pip uninstall -y torchvision 2>/dev/null || true
 
 $ZS run -v -p torch -p transformers -p accelerate -p cloudpickle /tmp/test_snapshot.py 2>&1
 echo ""
