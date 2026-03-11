@@ -434,12 +434,120 @@ fn uv_install(venv: &std::path::Path, specs: &[String]) -> Result<()> {
 fn parse_requirements_file(path: &str) -> Result<Vec<String>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read requirements file: {path}"))?;
-    Ok(content
+    Ok(parse_requirements_text(&content))
+}
+
+/// Parse requirements from text (requirements.txt format).
+fn parse_requirements_text(content: &str) -> Vec<String> {
+    content
         .lines()
         .map(|l| l.trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('-'))
         .map(|l| l.to_string())
-        .collect())
+        .collect()
+}
+
+/// Parse PEP 723 inline script metadata from a Python script.
+///
+/// Looks for:
+///   # /// script
+///   # dependencies = ["torch", "numpy"]
+///   # ///
+fn parse_pep723_deps(script_path: &std::path::Path) -> Vec<String> {
+    let content = match std::fs::read_to_string(script_path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    // Extract the script metadata block
+    let mut in_block = false;
+    let mut metadata = String::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "# /// script" {
+            in_block = true;
+            continue;
+        }
+        if in_block {
+            if trimmed == "# ///" {
+                break;
+            }
+            // Strip leading "# " prefix
+            if let Some(rest) = trimmed.strip_prefix("# ") {
+                metadata.push_str(rest);
+            } else if let Some(rest) = trimmed.strip_prefix("#") {
+                metadata.push_str(rest);
+            }
+            metadata.push('\n');
+        }
+    }
+
+    if metadata.is_empty() {
+        return Vec::new();
+    }
+
+    // Parse as TOML and extract dependencies
+    if let Ok(table) = metadata.parse::<toml::Value>() {
+        if let Some(deps) = table.get("dependencies").and_then(|d| d.as_array()) {
+            return deps
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+        }
+    }
+
+    Vec::new()
+}
+
+/// Auto-detect dependencies from the script's directory.
+///
+/// Searches for pyproject.toml or requirements.txt in the script's directory
+/// and parent directories (up to 3 levels).
+fn auto_detect_deps(script_path: &std::path::Path) -> Vec<String> {
+    let dir = script_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    // Walk up to 3 parent directories
+    let mut search_dir = dir.to_path_buf();
+    for _ in 0..4 {
+        // Check pyproject.toml
+        let pyproject = search_dir.join("pyproject.toml");
+        if pyproject.exists() {
+            if let Ok(content) = std::fs::read_to_string(&pyproject) {
+                if let Ok(deps) = resolve::parse_pyproject_dependencies(&content) {
+                    if !deps.is_empty() {
+                        tracing::info!(
+                            "Auto-detected deps from {}",
+                            pyproject.display()
+                        );
+                        return deps;
+                    }
+                }
+            }
+        }
+
+        // Check requirements.txt
+        let reqs_txt = search_dir.join("requirements.txt");
+        if reqs_txt.exists() {
+            if let Ok(content) = std::fs::read_to_string(&reqs_txt) {
+                let deps = parse_requirements_text(&content);
+                if !deps.is_empty() {
+                    tracing::info!(
+                        "Auto-detected deps from {}",
+                        reqs_txt.display()
+                    );
+                    return deps;
+                }
+            }
+        }
+
+        if !search_dir.pop() {
+            break;
+        }
+    }
+
+    Vec::new()
 }
 
 /// Shared wheel cache directory: `$ZEROSTART_CACHE/shared_wheels/{name}-{version}/`
@@ -691,14 +799,35 @@ async fn main() -> Result<()> {
         } => {
             let python = find_python()?;
 
-            // Build requirements list
+            // Build requirements list from auto-detection + explicit flags
             let mut reqs: Vec<String> = Vec::new();
-            let is_script = target.ends_with(".py")
-                || std::path::Path::new(&target).is_file();
+            let target_path = std::path::Path::new(&target);
+            let is_script = target.ends_with(".py") || target_path.is_file();
 
             if !is_script {
+                // Target is a package name (e.g. "zerostart run torch")
                 reqs.push(target.clone());
+            } else {
+                // Target is a script — auto-detect deps
+                // Priority: PEP 723 inline metadata > pyproject.toml > requirements.txt
+                let pep723 = parse_pep723_deps(target_path);
+                if !pep723.is_empty() {
+                    if verbose {
+                        eprintln!("Found PEP 723 deps: {}", pep723.join(", "));
+                    }
+                    reqs.extend(pep723);
+                } else {
+                    let auto = auto_detect_deps(target_path);
+                    if !auto.is_empty() {
+                        if verbose {
+                            eprintln!("Auto-detected deps: {}", auto.join(", "));
+                        }
+                        reqs.extend(auto);
+                    }
+                }
             }
+
+            // Explicit flags are additive
             reqs.extend(packages.clone());
 
             if let Some(ref req_file) = requirements {
@@ -706,7 +835,7 @@ async fn main() -> Result<()> {
             }
 
             if reqs.is_empty() {
-                // No deps — just exec the script directly
+                // No deps found anywhere — just exec the script directly
                 exec_python(&python, std::path::Path::new("."), &target, &target_args);
             }
 
@@ -1108,4 +1237,155 @@ async fn run_engine(
     eprintln!("Total time: {:.1}s", elapsed.as_secs_f64());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_pep723_basic() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("test.py");
+        std::fs::write(
+            &script,
+            r#"# /// script
+# dependencies = ["torch", "numpy>=1.24"]
+# ///
+
+import torch
+"#,
+        )
+        .unwrap();
+
+        let deps = parse_pep723_deps(&script);
+        assert_eq!(deps, vec!["torch", "numpy>=1.24"]);
+    }
+
+    #[test]
+    fn test_parse_pep723_no_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("test.py");
+        std::fs::write(&script, "import torch\nprint('hello')\n").unwrap();
+
+        let deps = parse_pep723_deps(&script);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pep723_empty_deps() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("test.py");
+        std::fs::write(
+            &script,
+            "# /// script\n# dependencies = []\n# ///\nimport os\n",
+        )
+        .unwrap();
+
+        let deps = parse_pep723_deps(&script);
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pep723_multiline() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("test.py");
+        std::fs::write(
+            &script,
+            r#"# /// script
+# dependencies = [
+#   "torch>=2.0",
+#   "transformers",
+#   "safetensors",
+# ]
+# ///
+
+import torch
+"#,
+        )
+        .unwrap();
+
+        let deps = parse_pep723_deps(&script);
+        assert_eq!(deps, vec!["torch>=2.0", "transformers", "safetensors"]);
+    }
+
+    #[test]
+    fn test_parse_requirements_text() {
+        let text = "torch>=2.0\n# comment\nnumpy\n\n-f https://url\nrequests\n";
+        let deps = parse_requirements_text(text);
+        assert_eq!(deps, vec!["torch>=2.0", "numpy", "requests"]);
+    }
+
+    #[test]
+    fn test_auto_detect_pyproject() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = [\"numpy\", \"requests\"]\n",
+        )
+        .unwrap();
+        let script = dir.path().join("app.py");
+        std::fs::write(&script, "import numpy\n").unwrap();
+
+        let deps = auto_detect_deps(&script);
+        assert_eq!(deps, vec!["numpy", "requests"]);
+    }
+
+    #[test]
+    fn test_auto_detect_requirements_txt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("requirements.txt"),
+            "numpy\nrequests\n",
+        )
+        .unwrap();
+        let script = dir.path().join("app.py");
+        std::fs::write(&script, "import numpy\n").unwrap();
+
+        let deps = auto_detect_deps(&script);
+        assert_eq!(deps, vec!["numpy", "requests"]);
+    }
+
+    #[test]
+    fn test_auto_detect_prefers_pyproject_over_requirements() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\ndependencies = [\"from-pyproject\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("requirements.txt"),
+            "from-requirements\n",
+        )
+        .unwrap();
+        let script = dir.path().join("app.py");
+        std::fs::write(&script, "pass\n").unwrap();
+
+        let deps = auto_detect_deps(&script);
+        assert_eq!(deps, vec!["from-pyproject"]);
+    }
+
+    #[test]
+    fn test_auto_detect_walks_parent_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("src");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(dir.path().join("requirements.txt"), "numpy\n").unwrap();
+        let script = subdir.join("app.py");
+        std::fs::write(&script, "import numpy\n").unwrap();
+
+        let deps = auto_detect_deps(&script);
+        assert_eq!(deps, vec!["numpy"]);
+    }
+
+    #[test]
+    fn test_auto_detect_no_deps_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("app.py");
+        std::fs::write(&script, "print('hello')\n").unwrap();
+
+        let deps = auto_detect_deps(&script);
+        assert!(deps.is_empty());
+    }
 }
