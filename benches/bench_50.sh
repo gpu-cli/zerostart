@@ -4,7 +4,7 @@
 
 set -o pipefail
 
-PYTHON=/Users/jameslal/workspace/jl/zerostart/.venv/bin/python3
+PYTHON="${PYTHON:-python3}"
 RESULTS_FILE="$(cd "$(dirname "$0")/.." && pwd)/benches/results/bench_50.csv"
 mkdir -p "$(dirname "$RESULTS_FILE")"
 
