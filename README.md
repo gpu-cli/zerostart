@@ -1,6 +1,6 @@
 # zerostart
 
-**Fast cold starts for GPU Python.** Parallel streaming wheel extraction built for installing large packages on remote GPUs.
+Parallel streaming wheel extraction for installing large Python packages on remote GPUs.
 
 ```bash
 zerostart run -p torch serve.py
@@ -10,45 +10,42 @@ Works on any container GPU provider — RunPod, Vast.ai, Lambda, etc.
 
 ## Benchmarks
 
-Measured on RTX 4090 pods (RunPod). Both tools download the same wheels from PyPI — zerostart is faster because of *how* it downloads.
+Measured on RTX 4090 pods (RunPod). Results vary with network speed — slower pod networks show a larger advantage for zerostart because there's more room for parallel downloads to help.
 
 ### Cold Start (first run, empty cache)
 
-| Workload | Packages | Size | zerostart | uvx | Speedup |
-|----------|----------|------|-----------|-----|---------|
-| torch + CUDA | 27 wheels | 6.8 GB | **47.9s** | 512.2s | **10.7x** |
-| vllm (full LLM stack) | 177 wheels | 9.4 GB | **69.6s** | 862.1s | **12.4x** |
-| transformers + torch | 51 wheels | 7.0 GB | **45.4s** | — | — |
-| diffusers + torch | 60 wheels | 7.0 GB | **50.4s** | — | — |
-| triton | 1 wheel | 638 MB | **7.0s** | — | — |
+| Workload | zerostart | uv | Speedup |
+|----------|-----------|-----|---------|
+| torch + CUDA (6.8 GB) | 33s | 98s | 3x |
+| vllm (9.4 GB) | 60s | 58s | ~1x |
+| triton (638 MB) | 3.4s | 1.0s | uv faster |
+
+zerostart's cold start advantage comes from parallel HTTP Range requests. For large packages like torch on a bandwidth-limited connection, this matters. For small packages like triton, the overhead isn't worth it — just use uv.
+
+vllm cold starts are roughly comparable. The package set is large (177 wheels) but many are small, so uv's single-connection approach keeps up.
 
 ### Warm Start (cached environment)
 
-| Workload | zerostart | uvx | Speedup |
+| Workload | zerostart | uv | Speedup |
 |----------|-----------|-----|---------|
-| torch | **2.5s** | 25.5s | **10.2x** |
-| vllm | **3.6s** | 114.0s | **31.7x** |
-| transformers + torch | **3.9s** | — | — |
-| diffusers + torch | **5.3s** | — | — |
-| triton | **0.9s** | — | — |
+| torch | 1.8s | 13.2s | 7x |
+| vllm | 3.3s | 14.5s | 4x |
+| triton | 0.2s | 1.0s | 5x |
 
-On a faster pod (1Gbps+ network), cold starts drop further:
+Warm starts are where zerostart consistently wins. uv re-resolves dependencies and rebuilds the environment on every run. zerostart checks a cache marker and exec's Python directly — no resolution, no environment setup.
 
-| Workload | zerostart | uvx | Speedup |
-|----------|-----------|-----|---------|
-| torch | **23.1s** | 90.9s | **3.9x** |
-| vllm | **33.3s** | 138.1s | **4.1x** |
+### Network speed matters
 
-## Why Is It Faster?
+On pods with slower network (common with cheaper providers), the cold start advantage grows because parallel Range requests can saturate the link where a single connection can't. On fast-network pods (1Gbps+), uv downloads quickly enough that the parallel approach helps less.
+
+## How It Works
 
 ### Cold starts: parallel Range-request streaming
 
-uvx downloads each wheel as a single HTTP connection. A 873MB torch wheel = one TCP stream.
-
-zerostart uses **HTTP Range requests** to download multiple chunks of each wheel in parallel, and starts extracting files while chunks are still arriving:
+uv downloads each wheel as a single HTTP connection. zerostart uses HTTP Range requests to download multiple chunks of each wheel in parallel, and starts extracting files while chunks are still arriving:
 
 ```
-uvx (sequential per wheel):
+uv (sequential per wheel):
   torch.whl  [=========downloading=========>] then [==extracting==]
   numpy.whl  [=====>] then [=]
 
@@ -60,22 +57,18 @@ zerostart (parallel chunks, overlapped extraction):
   numpy.whl  [=>]──extract──►               ← all wheels in parallel
 ```
 
-On a slow network, this is the difference between 1 connection at 15 MB/s (60s for torch) and 16+ connections saturating the link.
+### Warm starts: Rust cache check vs re-resolve
 
-### Warm starts: Rust cache check vs full re-resolve
-
-uvx re-resolves dependencies and rebuilds the tool environment on every invocation — even when packages are cached. For vllm (177 packages), that means 177 cache lookups + metadata checks + links.
+uv re-resolves dependencies and rebuilds the tool environment on every invocation — even when packages are cached. For vllm (177 packages), that means metadata checks and linking for each one.
 
 zerostart's warm path is three operations in Rust:
 1. `stat(".complete")` — does the cached environment exist?
 2. `find("lib/python*/site-packages")` — locate it
 3. `exec(python)` — run directly
 
-No resolution, no environment setup, no uv involved.
-
 ### Shared CUDA layer cache
 
-CUDA libraries (nvidia-cublas, nvidia-cudnn, nvidia-nccl, etc.) are ~6GB and identical across torch, vllm, and diffusers environments. zerostart caches extracted wheels at `$ZEROSTART_CACHE/shared_wheels/` and hardlinks them into new environments — so the second torch-based environment skips downloading those 6GB entirely.
+CUDA libraries (nvidia-cublas, nvidia-cudnn, nvidia-nccl, etc.) are ~6GB and identical across torch, vllm, and diffusers environments. zerostart caches extracted wheels and hardlinks them into new environments — so the second torch-based environment skips re-extracting those 6GB.
 
 ## Install
 
@@ -99,11 +92,11 @@ Requires Linux + Python 3.10+ + `uv` (pre-installed on most GPU containers).
 ## Quick Start
 
 ```bash
-# Run a package (like uvx)
-zerostart run torch -- -c "import torch; print(torch.cuda.is_available())"
-
 # Run a script with dependencies
 zerostart run -p torch -p transformers serve.py
+
+# Run inline
+zerostart run torch -- -c "import torch; print(torch.cuda.is_available())"
 
 # With a requirements file
 zerostart run -r requirements.txt serve.py
@@ -134,18 +127,17 @@ zerostart run serve.py  # deps auto-detected from script
 
 ## Model Loading Acceleration
 
-`zerostart.accelerate()` transparently patches `from_pretrained` to load models up to 9x faster. No code changes needed — just add one line:
+`zerostart.accelerate()` patches `from_pretrained` to speed up model loading by skipping unnecessary work (random weight init, repeated downloads). Add one line:
 
 ```python
 import zerostart
 zerostart.accelerate()
 
-# Your existing code runs unchanged, but 9x faster
 from transformers import AutoModelForCausalLM
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B", device_map="cuda")
 ```
 
-Or via CLI with zero code changes:
+Or via CLI:
 
 ```bash
 zerostart run --accelerate -p torch -p transformers serve.py
@@ -153,31 +145,18 @@ zerostart run --accelerate -p torch -p transformers serve.py
 
 ### How it works
 
-Three transparent hooks eliminate the bottlenecks in standard model loading:
-
-| Hook | Target | What it fixes | Speedup |
-|------|--------|---------------|---------|
-| Meta device init | `from_pretrained` | Skips random weight initialization (75% of load time) | ~4x |
-| Auto-cache | `from_pretrained` | Snapshots model on first load, mmap hydrate on repeat | ~9x |
-| Network volume fix | `safetensors.load_file` | Eager read instead of mmap on NFS/JuiceFS (cold reads) | situational* |
-| .bin conversion | `torch.load` | Converts legacy checkpoints to safetensors, mmaps on repeat | ~2x |
+| Hook | What it does |
+|------|-------------|
+| Meta device init | Skips random weight initialization during `from_pretrained` |
+| Auto-cache | Snapshots model on first load, mmap hydrate on repeat |
+| Network volume fix | Eager read instead of mmap on NFS/JuiceFS (cold reads only*) |
+| .bin conversion | Converts legacy checkpoints to safetensors, mmaps on repeat |
 
 *Network volume fix only helps on cold reads from network-backed filesystems where mmap page faults trigger network round-trips. On FUSE with warm page cache (most container providers), mmap is already fast.
 
-### Benchmarks (model loading)
-
-Measured on RTX A6000 with Qwen2.5-7B (15.2GB):
-
-| Scenario | Baseline | zerostart.accelerate() | Speedup |
-|----------|----------|------------------------|---------|
-| from_pretrained (cold) | 91.75s | 11.39s | **8.1x** |
-| from_pretrained (cached) | 91.75s | 10.20s | **9.0x** |
-
-Identical output. Works with transformers, diffusers, and any framework using safetensors.
-
 ### Model Cache
 
-Models are automatically cached after first load. Manage the cache with the `ModelCache` API:
+Models are automatically cached after first load:
 
 ```python
 from zerostart.model_cache import ModelCache
@@ -189,35 +168,15 @@ cache.auto_evict(max_size_bytes=50e9)   # LRU eviction to stay under 50GB
 
 ### vLLM Integration
 
-A custom model loader for vLLM that switches safetensors loading from mmap to eager read on network filesystems (NFS, JuiceFS, CIFS) where mmap page faults are 30-50x slower.
+A custom model loader for vLLM that switches safetensors loading from mmap to eager read on network filesystems (NFS, JuiceFS, CIFS).
 
-**Not enabled by default.** On most container providers (RunPod, Vast.ai), the kernel page cache makes mmap fast enough. The eager path only helps on cold reads from truly slow network storage.
+**Not enabled by default.** On most container providers, the kernel page cache makes mmap fast enough. The eager path only helps on cold reads from slow network storage.
 
 ```bash
-# Opt in via --load-format
 vllm serve Qwen/Qwen2.5-7B --load-format zerostart
-
-# Or via env var
-ZEROSTART_EAGER=1 vllm serve Qwen/Qwen2.5-7B --load-format zerostart
 ```
 
-Auto-registers via vLLM's plugin system when zerostart is installed (`pip install zerostart`).
-
-### Serving Integration
-
-For custom serving stacks:
-
-```python
-from zerostart.integrations.serving import ModelServer
-
-server = ModelServer("/volume/models")
-server.preload({
-    "llm": "Qwen/Qwen2.5-7B",
-    "embedder": "BAAI/bge-small-en-v1.5",
-}, device="cuda")
-
-model = server.get("llm")  # Ready for inference
-```
+Auto-registers via vLLM's plugin system when zerostart is installed.
 
 ## Architecture
 
@@ -229,7 +188,7 @@ zerostart run -p torch serve.py
   1. Find Python          (uv python find || which python3)
   2. Check warm cache     (stat .complete marker — instant)
   3. Resolve deps         (uv pip compile --format pylock.toml)
-  4. Check shared cache   (hardlink cached CUDA libs — parallel via rayon)
+  4. Check shared cache   (hardlink cached CUDA libs)
   5. Stream wheels        (parallel Range-request download + extract)
   6. exec(python)         (replaces process, no overhead)
 ```
@@ -238,12 +197,10 @@ Key design decisions:
 
 - **All wheels through the streaming daemon** — every package with a wheel URL goes through parallel download+extract. Only sdist-only packages (rare) fall back to `uv pip install`.
 - **Atomic extraction** — each wheel extracts to a staging directory, then renames into site-packages. Partial extractions never corrupt the target.
-- **No venv overhead** — uses a flat site-packages directory with a content-addressed cache key. No `uv venv` on the critical path.
+- **No venv overhead** — uses a flat site-packages directory with a content-addressed cache key.
 - **Demand-driven scheduling** — when Python hits `import torch`, the daemon reprioritizes torch to the front of the download queue.
 
 ## Tuning
-
-Performance knobs via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -252,28 +209,23 @@ Performance knobs via environment variables:
 | `ZS_CHUNK_MB` | 16 | Streaming chunk size (MB) for Range requests |
 | `ZEROSTART_CACHE` | `~/.cache/zerostart` | Cache directory |
 
-```bash
-# Crank up parallelism on a fast network
-ZS_PARALLEL_DOWNLOADS=32 ZS_CHUNK_MB=32 zerostart run -v -p torch test.py
-```
-
 ## When to Use It
 
-**Use zerostart when:**
-- Deploying large GPU packages (torch, vllm, diffusers) on container providers
-- Cold starts matter — spot instances, CI/CD, autoscaling
-- Loading large models (7B+) repeatedly — `accelerate()` gives 8-9x speedup
-- You want warm starts under 4 seconds for 177-package stacks
+**Good fit:**
+- Large GPU packages (torch, vllm, diffusers) on container providers with moderate network
+- Repeated runs where warm start time matters
+- Spot instances, CI/CD, autoscaling where cold starts add up
 
-**Don't bother when:**
-- Small packages (ruff, black, httpie) — uvx is fast enough, zerostart adds ~0.5s overhead
-- One-off scripts that don't repeat — cold start optimization doesn't pay off
-- You're already on local NVMe with models in page cache — mmap is already fast
+**Not worth it:**
+- Small packages — uv is already fast, zerostart adds overhead
+- One-off scripts that don't repeat
+- Pods with very fast network (1Gbps+) where uv cold starts are already quick
+- Local NVMe with models in page cache
 
 ## Requirements
 
 - Linux (container GPU providers: RunPod, Vast.ai, Lambda, etc.)
-- `uv` for requirement resolution (pre-installed on most GPU containers)
+- `uv` for dependency resolution (pre-installed on most GPU containers)
 - Python 3.10+
 
 macOS works for development (same CLI, no streaming optimization).
@@ -283,7 +235,6 @@ macOS works for development (same CLI, no streaming optimization).
 If you use [gpu-cli](https://gpu-cli.sh):
 
 ```bash
-# Your script runs on a GPU pod with fast package loading
 gpu run "zerostart run -p torch serve.py"
 ```
 
