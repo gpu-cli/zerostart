@@ -81,12 +81,18 @@ CUDA libraries (nvidia-cublas, nvidia-cudnn, nvidia-nccl, etc.) are ~6GB and ide
 ## Install
 
 ```bash
-# Rust binary (fast wheel installation + streaming)
+curl -fsSL https://raw.githubusercontent.com/gpu-cli/zerostart/main/install.sh | sh
+```
+
+Or manually:
+
+```bash
+# Binary only
 curl -fsSL https://github.com/gpu-cli/zerostart/releases/latest/download/zerostart-linux-x86_64 \
   -o /usr/local/bin/zerostart && chmod +x /usr/local/bin/zerostart
 
-# Python SDK (model acceleration, integrations)
-pip install zerostart
+# Python SDK (for accelerate(), vLLM integration)
+pip install git+https://github.com/gpu-cli/zerostart.git#subdirectory=python
 ```
 
 Requires Linux + Python 3.10+ + `uv` (pre-installed on most GPU containers).
