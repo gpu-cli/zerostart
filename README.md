@@ -3,28 +3,28 @@
 Parallel streaming wheel extraction for installing large Python packages on remote GPUs.
 
 ```bash
-zerostart run -p torch serve.py
+zerostart run serve.py
 ```
 
-Works on any container GPU provider — RunPod, Vast.ai, Lambda, etc.
+Auto-detects dependencies from PEP 723 inline metadata, `pyproject.toml`, or `requirements.txt`. Works on any container GPU provider — RunPod, Vast.ai, Lambda, etc.
 
 ## Benchmarks
 
-Measured on RTX 4090 pods (RunPod). Results vary with network speed — slower pod networks show a larger advantage for zerostart because there's more room for parallel downloads to help.
-
 ### Cold Start (first run, empty cache)
 
-| Workload | zerostart | uv | Speedup |
-|----------|-----------|-----|---------|
-| torch + CUDA (6.8 GB) | 33s | 98s | 3x |
-| vllm (9.4 GB) | 60s | 58s | ~1x |
-| triton (638 MB) | 3.4s | 1.0s | uv faster |
+Cold start speedup depends on pod network bandwidth. zerostart opens multiple parallel HTTP connections per wheel — this helps when a single connection can't saturate the link, but doesn't help when one connection already maxes out the pipe.
 
-zerostart's cold start advantage comes from parallel HTTP Range requests. For large packages like torch on a bandwidth-limited connection, this matters. For small packages like triton, the overhead isn't worth it — just use uv.
+| Pod network | Workload | zerostart | uv | Speedup |
+|-------------|----------|-----------|-----|---------|
+| Moderate (~200 Mbps) | torch (6.8 GB) | 33s | 98s | 3x |
+| Moderate (~200 Mbps) | triton (638 MB) | 3.4s | 1.0s | uv faster |
+| Fast (~1 Gbps) | diffusers+torch (7 GB) | 57s | 57s | ~1x |
 
-vllm cold starts are roughly comparable. The package set is large (177 wheels) but many are small, so uv's single-connection approach keeps up.
+On bandwidth-constrained pods (common with cheaper providers), parallel Range requests download large wheels 3x faster. On fast-network pods, a single connection already saturates the link and both tools finish in about the same time. For small packages, zerostart's startup overhead makes uv faster — just use uv directly.
 
 ### Warm Start (cached environment)
+
+Warm starts are where zerostart consistently wins regardless of network speed. uv re-resolves dependencies and rebuilds the environment on every invocation. zerostart checks a cache marker and exec's Python directly.
 
 | Workload | zerostart | uv | Speedup |
 |----------|-----------|-----|---------|
@@ -32,11 +32,7 @@ vllm cold starts are roughly comparable. The package set is large (177 wheels) b
 | vllm | 3.3s | 14.5s | 4x |
 | triton | 0.2s | 1.0s | 5x |
 
-Warm starts are where zerostart consistently wins. uv re-resolves dependencies and rebuilds the environment on every run. zerostart checks a cache marker and exec's Python directly — no resolution, no environment setup.
-
-### Network speed matters
-
-On pods with slower network (common with cheaper providers), the cold start advantage grows because parallel Range requests can saturate the link where a single connection can't. On fast-network pods (1Gbps+), uv downloads quickly enough that the parallel approach helps less.
+All measured on RunPod (RTX 4090 / A6000).
 
 ## How It Works
 
@@ -92,38 +88,39 @@ Requires Linux + Python 3.10+ + `uv` (pre-installed on most GPU containers).
 ## Quick Start
 
 ```bash
-# Run a script with dependencies
-zerostart run -p torch -p transformers serve.py
+# Auto-detect deps from PEP 723 metadata, pyproject.toml, or requirements.txt
+zerostart run serve.py
 
-# Run inline
-zerostart run torch -- -c "import torch; print(torch.cuda.is_available())"
+# Add extra packages on top of auto-detected deps
+zerostart run -p torch serve.py
 
-# With a requirements file
+# Explicit requirements file
 zerostart run -r requirements.txt serve.py
+
+# Run a package directly
+zerostart run torch -- -c "import torch; print(torch.cuda.is_available())"
 
 # Pass args to your script
 zerostart run serve.py -- --port 8000
 ```
 
-### PEP 723 Inline Script Metadata
+### Dependency Detection
 
-Embed dependencies directly in your script — no `requirements.txt` needed:
+zerostart automatically finds dependencies — no flags needed:
 
+1. **PEP 723 inline metadata** (checked first):
 ```python
 # /// script
 # dependencies = ["torch>=2.0", "transformers", "safetensors"]
 # ///
-
 import torch
-from transformers import AutoModel
-
-model = AutoModel.from_pretrained("bert-base-uncased")
-print(f"Loaded on {model.device}")
 ```
 
-```bash
-zerostart run serve.py  # deps auto-detected from script
-```
+2. **pyproject.toml** `[project.dependencies]` in the script's directory or parents
+
+3. **requirements.txt** in the script's directory or parents
+
+`-p` and `-r` flags add packages on top of whatever is auto-detected.
 
 ## Model Loading Acceleration
 
@@ -212,14 +209,13 @@ Key design decisions:
 ## When to Use It
 
 **Good fit:**
-- Large GPU packages (torch, vllm, diffusers) on container providers with moderate network
-- Repeated runs where warm start time matters
-- Spot instances, CI/CD, autoscaling where cold starts add up
+- Repeated runs on the same pod — warm starts are 4-7x faster than uv
+- Large GPU packages on bandwidth-constrained pods — parallel downloads help when a single connection is slow
+- Spot instances, CI/CD, autoscaling where you restart often and warm cache pays off
 
 **Not worth it:**
-- Small packages — uv is already fast, zerostart adds overhead
-- One-off scripts that don't repeat
-- Pods with very fast network (1Gbps+) where uv cold starts are already quick
+- One-off cold starts on fast-network pods — uv is just as fast
+- Small packages — uv is faster, zerostart adds startup overhead
 - Local NVMe with models in page cache
 
 ## Requirements
