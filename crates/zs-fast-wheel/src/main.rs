@@ -411,6 +411,7 @@ fn uv_install(venv: &std::path::Path, specs: &[String]) -> Result<()> {
     let mut args = vec![
         "pip".to_string(),
         "install".to_string(),
+        "--no-deps".to_string(),
         "--python".to_string(),
         python.display().to_string(),
     ];
@@ -776,31 +777,38 @@ async fn main() -> Result<()> {
             };
 
             if !plan.daemon_wheels.is_empty() {
+                let no_shared_cache = std::env::var("ZS_NO_SHARED_CACHE").is_ok();
+
                 // Check shared cache in parallel — restore cached wheels via hardlinks
-                let sp_for_cache = site_packages.clone();
-                let wheels_for_cache = plan.daemon_wheels.clone();
-                let cache_results: Vec<bool> = tokio::task::spawn_blocking(move || {
-                    use rayon::prelude::*;
-                    wheels_for_cache
-                        .par_iter()
-                        .map(|spec| restore_from_shared_cache(spec, &sp_for_cache))
-                        .collect()
-                })
-                .await?;
+                let (uncached_wheels, cached_count) = if no_shared_cache {
+                    (plan.daemon_wheels.clone(), 0u32)
+                } else {
+                    let sp_for_cache = site_packages.clone();
+                    let wheels_for_cache = plan.daemon_wheels.clone();
+                    let cache_results: Vec<bool> = tokio::task::spawn_blocking(move || {
+                        use rayon::prelude::*;
+                        wheels_for_cache
+                            .par_iter()
+                            .map(|spec| restore_from_shared_cache(spec, &sp_for_cache))
+                            .collect()
+                    })
+                    .await?;
 
-                let mut uncached_wheels = Vec::new();
-                let mut cached_count = 0u32;
+                    let mut uncached = Vec::new();
+                    let mut count = 0u32;
 
-                for (spec, was_cached) in plan.daemon_wheels.iter().zip(cache_results.iter()) {
-                    if *was_cached {
-                        cached_count += 1;
-                        if verbose {
-                            eprintln!("  {} (shared cache hit)", spec.distribution);
+                    for (spec, was_cached) in plan.daemon_wheels.iter().zip(cache_results.iter()) {
+                        if *was_cached {
+                            count += 1;
+                            if verbose {
+                                eprintln!("  {} (shared cache hit)", spec.distribution);
+                            }
+                        } else {
+                            uncached.push(spec.clone());
                         }
-                    } else {
-                        uncached_wheels.push(spec.clone());
                     }
-                }
+                    (uncached, count)
+                };
 
                 if verbose {
                     if cached_count > 0 {
@@ -843,13 +851,27 @@ async fn main() -> Result<()> {
                     }
 
                     // Populate shared cache for newly extracted wheels
-                    let sp_for_cache = site_packages.clone();
-                    tokio::task::spawn_blocking(move || {
-                        for spec in &wheels_to_cache {
-                            populate_shared_cache(spec, &sp_for_cache);
-                        }
-                    })
-                    .await?;
+                    // Skip if ZS_NO_SHARED_CACHE=1 or disk is tight (<2GB free)
+                    if std::env::var("ZS_NO_SHARED_CACHE").is_ok() {
+                        tracing::info!("Shared cache disabled via ZS_NO_SHARED_CACHE");
+                    } else {
+                        let sp_for_cache = site_packages.clone();
+                        tokio::task::spawn_blocking(move || {
+                            if let Ok(avail) = available_disk_mb(&sp_for_cache) {
+                                if avail < 2048 {
+                                    tracing::warn!(
+                                        "Skipping shared cache — only {}MB free",
+                                        avail
+                                    );
+                                    return;
+                                }
+                            }
+                            for spec in &wheels_to_cache {
+                                populate_shared_cache(spec, &sp_for_cache);
+                            }
+                        })
+                        .await?;
+                    }
                 }
             }
 
@@ -995,6 +1017,27 @@ async fn main() -> Result<()> {
                 }
             }
         }
+    }
+}
+
+/// Check available disk space in MB for the filesystem containing `path`.
+fn available_disk_mb(path: &Path) -> Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        let c_path = CString::new(path.to_string_lossy().as_bytes())
+            .context("invalid path for statvfs")?;
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let ret = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+        if ret != 0 {
+            anyhow::bail!("statvfs failed");
+        }
+        Ok((stat.f_bavail as u64 * stat.f_frsize as u64) / (1024 * 1024))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(u64::MAX) // assume unlimited on non-unix
     }
 }
 

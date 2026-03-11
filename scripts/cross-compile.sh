@@ -21,7 +21,10 @@ cd crates
 cargo zigbuild --target "$TARGET" --release -p zs-fast-wheel
 cd ..
 
-cp "crates/target/$TARGET/release/zs-fast-wheel" "$OUTDIR/zs-fast-wheel-linux-x86_64"
+cp "crates/target/$TARGET/release/zerostart" "$OUTDIR/zerostart-linux-x86_64"
+chmod +x "$OUTDIR/zerostart-linux-x86_64"
+# Also copy with old name for backwards compat
+cp "crates/target/$TARGET/release/zerostart" "$OUTDIR/zs-fast-wheel-linux-x86_64"
 chmod +x "$OUTDIR/zs-fast-wheel-linux-x86_64"
 
 echo ""

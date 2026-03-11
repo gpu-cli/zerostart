@@ -2509,6 +2509,7 @@ dependencies = [
  "hex",
  "indicatif",
  "io-uring",
+ "libc",
  "memmap2",
  "nix",
  "pyo3",

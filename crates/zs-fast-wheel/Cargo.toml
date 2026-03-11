@@ -57,6 +57,9 @@ hex = "0.4"
 toml = "0.8"
 pyo3 = { version = "0.28", features = ["extension-module"], optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 iouring = ["io-uring"]
