@@ -1,13 +1,12 @@
 # zerostart
 
-**Fast cold starts for GPU Python.** Drop-in replacement for `uvx` that's 10-12x faster on cold starts and 10-30x faster on warm starts.
+**Fast cold starts for GPU Python.** Parallel streaming wheel extraction built for installing large packages on remote GPUs.
 
 ```bash
-# Instead of: uvx --from torch python serve.py
 zerostart run -p torch serve.py
 ```
 
-No code changes. No platform lock-in. Works on any container GPU provider.
+Works on any container GPU provider — RunPod, Vast.ai, Lambda, etc.
 
 ## Benchmarks
 
