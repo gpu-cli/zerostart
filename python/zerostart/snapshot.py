@@ -3,12 +3,6 @@
 Strategy C (JSON-only): No cloudpickle. Tokenizer saved via save_pretrained,
 model config as JSON, tensors referenced in safetensors files via mmap.
 
-Cold hydrate of Qwen2.5-7B (15.2GB): ~1.7s (excluding inference)
-  - Rust tokenizer: 0.22s
-  - mmap 339 tensors: 0.07s
-  - import model class: 1.09s
-  - reconstruct model: 0.33s
-
 Usage:
     from zerostart.snapshot import snapshot, hydrate
 
@@ -32,6 +26,7 @@ import platform
 import struct
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -204,8 +199,14 @@ def _build_tensor_to_file_map(
 def _match_tensor_to_safetensors(
     ref_key: str,
     tensor_to_file: dict[str, tuple[Path, str]],
+    suffix_index: dict[str, list[tuple[Path, str]]] | None = None,
 ) -> tuple[str, str] | None:
-    """Try progressively stripping dot-prefixes to match a tensor name."""
+    """Try to match a tensor name to safetensors files.
+
+    Strategy 1: Progressive prefix stripping (handles model.model.X → model.X)
+    Strategy 2: Suffix matching (handles model.X → model.language_model.X for MoE)
+    """
+    # Strategy 1: strip dot-prefixes progressively
     candidates = [ref_key]
     remaining = ref_key
     while "." in remaining:
@@ -215,7 +216,44 @@ def _match_tensor_to_safetensors(
         if candidate in tensor_to_file:
             sf_path, sf_tensor_name = tensor_to_file[candidate]
             return str(sf_path), sf_tensor_name
+
+    # Strategy 2: suffix match — find safetensors keys that end with our param name
+    # This handles cases like state_dict "model.layers.0.weight" matching
+    # safetensors "model.language_model.layers.0.weight"
+    if suffix_index is not None:
+        # Try progressively shorter suffixes until we find a unique match
+        for n_components in (5, 4, 3):
+            suffix = _suffix_key(ref_key, n_components)
+            matches = suffix_index.get((n_components, suffix), [])
+            if len(matches) == 1:
+                sf_path, sf_tensor_name = matches[0]
+                return str(sf_path), sf_tensor_name
+
     return None
+
+
+def _suffix_key(name: str, n: int) -> str:
+    """Extract the last n dot-components of a tensor name."""
+    parts = name.rsplit(".", n)
+    if len(parts) <= n:
+        return name
+    return ".".join(parts[-(n):])
+
+
+def _build_suffix_index(
+    tensor_to_file: dict[str, tuple[Path, str]],
+) -> dict[tuple[int, str], list[tuple[Path, str]]]:
+    """Build a reverse index from tensor name suffixes to file locations.
+
+    Indexes at multiple suffix lengths (3, 4, 5 components) for matching
+    at the longest unique suffix. Only unique matches are used for safety.
+    """
+    index: dict[tuple[int, str], list[tuple[Path, str]]] = {}
+    for tensor_name, file_info in tensor_to_file.items():
+        for n in (3, 4, 5):
+            suffix = _suffix_key(tensor_name, n)
+            index.setdefault((n, suffix), []).append(file_info)
+    return index
 
 
 # ---------------------------------------------------------------------------
@@ -248,8 +286,9 @@ def snapshot(
     sf_files = list(dict.fromkeys(sf_files))
     log.info("Found %d safetensors files", len(sf_files))
 
-    # 2. Build tensor→file mapping
+    # 2. Build tensor→file mapping + suffix index for fuzzy matching
     tensor_to_file = _build_tensor_to_file_map(sf_files)
+    suffix_index = _build_suffix_index(tensor_to_file)
     log.info("Mapped %d tensors across safetensors files", len(tensor_to_file))
 
     # 3. Process each state entry
@@ -267,21 +306,19 @@ def snapshot(
 
             # Build tensor refs from state_dict
             sd = value.state_dict()
-            tensor_keys_for_model = []
             for param_name, tensor in sd.items():
                 ref_key = f"{key}.{param_name}"
                 ref_info: dict[str, Any] = {
                     "shape": list(tensor.shape),
                     "dtype": str(tensor.dtype),
                 }
-                match = _match_tensor_to_safetensors(ref_key, tensor_to_file)
+                match = _match_tensor_to_safetensors(ref_key, tensor_to_file, suffix_index)
                 if match:
                     ref_info["safetensors_file"] = match[0]
                     ref_info["safetensors_tensor"] = match[1]
                 else:
                     unmatched.append(ref_key)
                 tensor_refs[ref_key] = ref_info
-                tensor_keys_for_model.append(ref_key)
 
         elif _is_tokenizer(value):
             # Save tokenizer via save_pretrained (JSON files)
@@ -296,7 +333,7 @@ def snapshot(
                 "shape": list(value.shape),
                 "dtype": str(value.dtype),
             }
-            match = _match_tensor_to_safetensors(ref_key, tensor_to_file)
+            match = _match_tensor_to_safetensors(ref_key, tensor_to_file, suffix_index)
             if match:
                 ref_info["safetensors_file"] = match[0]
                 ref_info["safetensors_tensor"] = match[1]
@@ -304,12 +341,29 @@ def snapshot(
                 unmatched.append(ref_key)
             tensor_refs[ref_key] = ref_info
 
-    if unmatched:
-        log.warning("%d tensors not matched to safetensors — will be serialized", len(unmatched))
+    matched_count = len(tensor_refs) - len(unmatched)
+    match_ratio = matched_count / len(tensor_refs) if tensor_refs else 0
 
-    # 4. Serialize unmatched tensors
+    if match_ratio < 0.5:
+        log.warning(
+            "Only %d/%d tensors matched to safetensors (%.0f%%) — cache will be ineffective, skipping save",
+            matched_count, len(tensor_refs), match_ratio * 100,
+        )
+        # Clean up and return without saving — caller should fall back to normal loading
+        import shutil
+        if snap_dir.exists():
+            shutil.rmtree(snap_dir)
+        return snap_dir
+
     if unmatched:
-        _save_unmatched_tensors(snap_dir, unmatched, state, torch)
+        if len(unmatched) > 100:
+            log.warning(
+                "%d tensors not matched to safetensors — too many to serialize (MoE model?), skipping",
+                len(unmatched),
+            )
+        else:
+            log.warning("%d tensors not matched to safetensors — will be serialized", len(unmatched))
+            _save_unmatched_tensors(snap_dir, unmatched, state, torch)
 
     # 5. Write manifest (pure JSON, no pickle)
     manifest = {
@@ -330,7 +384,6 @@ def snapshot(
         json.dump(manifest, f)
 
     elapsed = time.monotonic() - t0
-    total_params = sum(1 for _ in tensor_refs)
     log.info(
         "Snapshot saved to %s (%.1fs, %d tensors, %d matched)",
         snap_dir, elapsed, len(tensor_refs), len(tensor_refs) - len(unmatched),
@@ -522,13 +575,33 @@ class _FastTokenizerWrapper:
         return self._tok.encode(text)
 
 
+def _load_shard_safe_open(
+    sf_path: Path,
+    tensor_pairs: list[tuple[str, str]],
+    device: str,
+) -> dict[str, Any]:
+    """Load tensors from a single safetensors shard using safe_open (lazy mmap)."""
+    from safetensors import safe_open
+    loaded: dict[str, Any] = {}
+    with safe_open(str(sf_path), framework="pt", device=device) as handle:
+        available = set(handle.keys())
+        for ref_key, sf_tensor_name in tensor_pairs:
+            if sf_tensor_name in available:
+                loaded[ref_key] = handle.get_tensor(sf_tensor_name)
+    return loaded
+
+
 def _load_tensors_mmap(
     manifest: dict[str, Any],
     snap_dir: Path,
     torch: Any,
     device: str = "cpu",
 ) -> dict[str, Any]:
-    """Load all referenced tensors via mmap, directly to target device."""
+    """Load all referenced tensors via mmap, directly to target device.
+
+    Uses safetensors.safe_open for lazy per-tensor loading (no bulk read).
+    Loads multiple shards in parallel for faster wall-clock time.
+    """
     tensor_refs = manifest.get("tensor_refs", {})
 
     # Group by safetensors file
@@ -545,37 +618,42 @@ def _load_tensors_mmap(
 
     loaded: dict[str, Any] = {}
 
-    for sf_file, tensor_pairs in file_to_tensors.items():
-        sf_path = Path(sf_file)
-        if not sf_path.exists():
-            log.warning("Safetensors file not found: %s", sf_file)
-            continue
+    # Load shards — use safe_open for lazy per-tensor mmap
+    # Parallelize across shards for large models
+    valid_shards = [
+        (Path(sf_file), pairs)
+        for sf_file, pairs in file_to_tensors.items()
+        if Path(sf_file).exists()
+    ]
 
-        # Try safetensors-streaming first (Rust mmap)
-        try:
-            import safetensors_streaming
-            handle = safetensors_streaming.safe_open(str(sf_path), framework="pt", device=device)
-            for ref_key, sf_tensor_name in tensor_pairs:
+    missing_shards = [
+        sf_file for sf_file in file_to_tensors
+        if not Path(sf_file).exists()
+    ]
+    for sf_file in missing_shards:
+        log.warning("Safetensors file not found: %s", sf_file)
+
+    if len(valid_shards) > 1:
+        # Parallel shard loading — each shard is an independent file
+        max_workers = min(len(valid_shards), 4)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {
+                pool.submit(_load_shard_safe_open, sf_path, pairs, device): str(sf_path)
+                for sf_path, pairs in valid_shards
+            }
+            for future in as_completed(futures):
+                sf_name = futures[future]
                 try:
-                    loaded[ref_key] = handle.get_tensor(sf_tensor_name)
+                    loaded.update(future.result())
                 except Exception as e:
-                    log.warning("Failed to load %s: %s", sf_tensor_name, e)
-            continue
-        except ImportError:
-            pass
-
-        # Standard safetensors — load directly to target device
+                    log.warning("Failed to load shard %s: %s", sf_name, e)
+    elif valid_shards:
+        # Single shard — no threading overhead
+        sf_path, pairs = valid_shards[0]
         try:
-            from safetensors.torch import load_file
-            all_tensors = load_file(str(sf_path), device=device)
-            for ref_key, sf_tensor_name in tensor_pairs:
-                if sf_tensor_name in all_tensors:
-                    loaded[ref_key] = all_tensors[sf_tensor_name]
-            continue
-        except ImportError:
-            pass
-
-        log.warning("No safetensors loader for %s", sf_file)
+            loaded.update(_load_shard_safe_open(sf_path, pairs, device))
+        except Exception as e:
+            log.warning("Failed to load shard %s: %s", sf_path, e)
 
     # Standalone (unmatched) tensors
     tensors_dir = snap_dir / "tensors"
@@ -647,7 +725,11 @@ def _reconstruct_module_from_config(
         try:
             module.load_state_dict(state_dict, strict=False, assign=True)
         except TypeError:
-            module.load_state_dict(state_dict, strict=False)
+            # assign=True requires PyTorch 2.1+
+            # Fall back: load to CPU first to avoid meta device issues
+            cpu_state = {k: v.to("cpu") if v.device.type != "cpu" else v for k, v in state_dict.items()}
+            module = module.to("cpu")
+            module.load_state_dict(cpu_state, strict=False)
 
         if hasattr(module, "tie_weights"):
             module.tie_weights()
@@ -656,8 +738,23 @@ def _reconstruct_module_from_config(
 
     _materialize_meta_tensors(module)
 
-    if device:
-        module = module.to(device)
+    # Check for any remaining meta tensors (can't use .to() on meta)
+    has_meta = any(p.device.type == "meta" for p in module.parameters())
+    if has_meta:
+        # to_empty materializes meta tensors as uninitialized on target device
+        target = device or "cpu"
+        module = module.to_empty(device=target)
+        log.warning("Used to_empty() — some parameters are uninitialized")
+    elif device:
+        # Only move to device if parameters aren't already there
+        needs_move = False
+        target_type = device.split(":")[0]
+        for p in module.parameters():
+            if p.device.type != target_type:
+                needs_move = True
+                break
+        if needs_move:
+            module = module.to(device)
 
     t_done = time.monotonic()
     log.info(

@@ -124,7 +124,7 @@ import torch
 
 ## Model Loading Acceleration
 
-`zerostart.accelerate()` patches `from_pretrained` to speed up model loading by skipping unnecessary work (random weight init, repeated downloads). Add one line:
+`zerostart.accelerate()` patches `from_pretrained` to speed up model loading. Sets `low_cpu_mem_usage=True` by default (skips random weight initialization), and auto-caches models for faster repeat loads on models that fit in GPU memory.
 
 ```python
 import zerostart
@@ -133,6 +133,14 @@ zerostart.accelerate()
 from transformers import AutoModelForCausalLM
 model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B", device_map="cuda")
 ```
+
+| Model | Cold (download+load) | Baseline (HF cached) | accelerate() | Notes |
+|-------|---------------------|---------------------|--------------|-------|
+| Qwen3.5-35B-A3B | 299s | 10.1s | 10.1s | MoE, 34.7B params, device_map='auto' |
+| Qwen2.5-7B | — | 5.5s | 3.3s | Fits in GPU, cache provides speedup |
+| Qwen2.5-1.5B | — | 3.5s | 3.2s | Small model, minimal difference |
+
+All measured on RTX A6000 (48GB). For models requiring `device_map='auto'` (model > VRAM), accelerate() matches baseline by eliminating random weight initialization. For models that fit entirely in GPU memory, the mmap cache provides additional speedup.
 
 Or via CLI:
 
@@ -144,12 +152,16 @@ zerostart run --accelerate -p torch -p transformers serve.py
 
 | Hook | What it does |
 |------|-------------|
-| Meta device init | Skips random weight initialization during `from_pretrained` |
-| Auto-cache | Snapshots model on first load, mmap hydrate on repeat |
+| `low_cpu_mem_usage` | Sets `low_cpu_mem_usage=True` by default — skips random weight initialization |
+| Auto-cache | Snapshots model on first load, mmap hydrate via `safe_open` on repeat (models that fit in GPU) |
+| Parallel shard loading | Loads multiple safetensors shards concurrently during cache hydration |
+| Suffix tensor matching | Handles MoE models where state_dict and safetensors use different key prefixes |
 | Network volume fix | Eager read instead of mmap on NFS/JuiceFS (cold reads only*) |
 | .bin conversion | Converts legacy checkpoints to safetensors, mmaps on repeat |
 
 *Network volume fix only helps on cold reads from network-backed filesystems where mmap page faults trigger network round-trips. On FUSE with warm page cache (most container providers), mmap is already fast.
+
+For `device_map='auto'` (model larger than VRAM), caching is skipped — HF's shard-by-shard loading directly to the right device is faster than our load-to-CPU-then-dispatch path.
 
 ### Model Cache
 

@@ -2,11 +2,12 @@
   "$schema": "https://gpu-cli.sh/schema/v1/gpu.json",
   "project_id": "zerostart",
   "gpu_types": [
-    { "type": "RTX 4090" },
     { "type": "RTX A6000" }
   ],
   "min_vram": 24,
-  "include": ["bin/", "tests/", "python/"],
+  "storage_mode": "built-in",
+  "workspace_size_gb": 100,
+  "include": ["bin/", "tests/", "python/", "README.md"],
   "outputs": ["benches/results/"],
   "environment": {
     "system": {

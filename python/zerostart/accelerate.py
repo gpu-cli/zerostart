@@ -1,13 +1,12 @@
 """Transparent model loading acceleration.
 
-One line enables 4x faster model loading — no user code changes needed:
+One line enables faster model loading — no user code changes needed:
 
     import zerostart
     zerostart.accelerate()
 
     from transformers import AutoModelForCausalLM
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-7B", device_map="cuda")
-    # 4x faster, identical result
 
 Hooks:
     1. transformers PreTrainedModel.from_pretrained — meta device init + cache
@@ -19,6 +18,7 @@ Hooks:
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -29,6 +29,7 @@ log = logging.getLogger("zerostart.accelerate")
 
 _hooks: list[tuple[str, Callable[[], None]]] = []
 _cache: ModelCache | None = None
+_bg_save_thread: threading.Thread | None = None
 
 
 def accelerate(
@@ -80,7 +81,11 @@ def accelerate(
 
 def decelerate() -> None:
     """Remove all hooks, restore original functions."""
-    global _cache
+    global _cache, _bg_save_thread
+    # Wait for any background save to complete
+    if _bg_save_thread is not None and _bg_save_thread.is_alive():
+        _bg_save_thread.join(timeout=30)
+        _bg_save_thread = None
     for name, unpatch in reversed(_hooks):
         unpatch()
         log.debug("Removed hook: %s", name)
@@ -119,7 +124,13 @@ def _try_hook_transformers(config: dict[str, Any]) -> None:
         # Try cache
         key = cache_key(str(pretrained_model_name_or_path), kwargs)
         device = kwargs.get("device_map", kwargs.get("device"))
-        if mc.has(key):
+
+        # Skip cache for device_map='auto' — HF's shard-by-shard loading to
+        # the right device is faster than our load-to-CPU-then-dispatch path.
+        # We still benefit from low_cpu_mem_usage=True below.
+        use_cache = device != "auto"
+
+        if use_cache and mc.has(key):
             t0 = time.monotonic()
             state = mc.load(key, device=_resolve_device(device))
             model = state.get("model")
@@ -138,23 +149,51 @@ def _try_hook_transformers(config: dict[str, Any]) -> None:
         elapsed = time.monotonic() - t0
         log.info("from_pretrained(%s): %.2fs (accelerated)", pretrained_model_name_or_path, elapsed)
 
-        # Auto-cache for next load
-        if auto:
-            try:
-                mc.save(
-                    key,
-                    {"model": model},
-                    model_id=str(pretrained_model_name_or_path),
-                    dtype=str(kwargs.get("torch_dtype", kwargs.get("dtype", "auto"))),
-                    revision=kwargs.get("revision", "main"),
-                )
-            except Exception as e:
-                log.warning("Auto-cache failed for %s: %s", pretrained_model_name_or_path, e)
+        # Auto-cache in background thread (non-blocking)
+        # Skip for device_map='auto' — cache won't be used anyway
+        if auto and use_cache:
+            _bg_cache_save(mc, key, model, str(pretrained_model_name_or_path), kwargs)
 
         return model
 
     PreTrainedModel.from_pretrained = patched
     _hooks.append(("transformers", lambda: setattr(PreTrainedModel, "from_pretrained", original)))
+
+
+def _bg_cache_save(
+    mc: ModelCache,
+    key: str,
+    model: Any,
+    model_id: str,
+    kwargs: dict[str, Any],
+) -> None:
+    """Save model to cache in a background thread."""
+    global _bg_save_thread
+
+    # Capture state_dict eagerly on main thread (safe reference to tensor memory)
+    try:
+        import torch
+        # Verify model has parameters before attempting save
+        param_count = sum(1 for _ in model.parameters())
+        if param_count == 0:
+            return
+    except Exception:
+        return
+
+    def _save() -> None:
+        try:
+            mc.save(
+                key,
+                {"model": model},
+                model_id=model_id,
+                dtype=str(kwargs.get("torch_dtype", kwargs.get("dtype", "auto"))),
+                revision=kwargs.get("revision", "main"),
+            )
+        except Exception as e:
+            log.warning("Background cache save failed for %s: %s", model_id, e)
+
+    _bg_save_thread = threading.Thread(target=_save, daemon=True)
+    _bg_save_thread.start()
 
 
 # ---------------------------------------------------------------------------
@@ -189,10 +228,7 @@ def _try_hook_diffusers(config: dict[str, Any]) -> None:
         log.info("diffusers.from_pretrained(%s): %.2fs", pretrained_model_name_or_path, time.monotonic() - t0)
 
         if auto:
-            try:
-                mc.save(key, {"model": model}, model_id=f"diffusers:{pretrained_model_name_or_path}")
-            except Exception as e:
-                log.warning("Auto-cache failed: %s", e)
+            _bg_cache_save(mc, key, model, f"diffusers:{pretrained_model_name_or_path}", kwargs)
 
         return model
 
@@ -254,7 +290,11 @@ def _try_hook_safetensors(config: dict[str, Any]) -> None:
             t0 = time.monotonic()
             with open(path, "rb") as f:
                 data = f.read()
-            result = safetensors.torch.load(data, device=device)
+            # safetensors.torch.load() (bytes) doesn't accept device kwarg
+            result = safetensors.torch.load(data)
+            if device and device != "cpu":
+                import torch
+                result = {k: v.to(device) for k, v in result.items()}
             log.debug("Eager read %s (%.2fs, network volume)", Path(path).name, time.monotonic() - t0)
             return result
         return original(filename, device=device)
@@ -304,7 +344,7 @@ def _try_hook_torch_load(config: dict[str, Any]) -> None:
         # Load normally
         result = original(f, *args, **kwargs)
 
-        # Cache as safetensors for next time
+        # Cache as safetensors for next time (background)
         if isinstance(result, dict):
             # Only cache if all values are tensors
             all_tensors = True
@@ -343,10 +383,14 @@ def _is_network_volume(path: str) -> bool:
 
 
 def _check_network_volume(path: str) -> bool:
-    """Detect FUSE/NFS/overlay mounts via /proc/mounts."""
+    """Detect FUSE/NFS mounts via /proc/mounts.
+
+    overlay is intentionally excluded — most container providers (RunPod, etc.)
+    use overlay backed by local SSD where mmap is fast.
+    """
     slow_fs_types = frozenset({
         "fuse", "fuse.juicefs", "fuse.gcsfuse", "fuse.sshfs",
-        "nfs", "nfs4", "cifs", "smbfs", "9p", "overlay",
+        "nfs", "nfs4", "cifs", "smbfs", "9p",
     })
 
     try:
