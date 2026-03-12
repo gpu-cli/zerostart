@@ -64,6 +64,29 @@ def _find_uv() -> str:
     return uv
 
 
+def _activate_accelerate(opts: dict[str, str | None]) -> None:
+    """Enable model loading acceleration after environment is ready."""
+    from zerostart.accelerate import accelerate
+    accelerate(cache_dir=opts.get("cache_dir"))
+
+
+def _activate_env(site_packages: Path) -> None:
+    """Activate the zerostart environment by adding it to sys.path and isolating from system packages.
+
+    System dist-packages (e.g. /usr/local/lib/python3.11/dist-packages) can contain
+    packages incompatible with the zerostart env (e.g. torchvision built for an older torch).
+    We remove system dist-packages from sys.path to prevent these from leaking through.
+    """
+    sys.path.insert(0, str(site_packages))
+    # Remove system dist-packages to prevent incompatible system packages from leaking.
+    # Keep the zerostart site-packages and stdlib paths.
+    zs_sp = str(site_packages)
+    sys.path[:] = [
+        p for p in sys.path
+        if p == zs_sp or "dist-packages" not in p
+    ]
+
+
 def _is_script(target: str) -> bool:
     """Determine if target is a Python script (vs a package name)."""
     if target.endswith(".py"):
@@ -408,7 +431,7 @@ def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | Non
     # Try uv-only fast path first
     if complete_marker.exists():
         log.info("Cache hit — environment ready")
-        sys.path.insert(0, str(site_packages))
+        _activate_env(site_packages)
         return venv, site_packages, None, None, [], None
 
     # Cold path: resolve to figure out which wheels need daemon
@@ -418,7 +441,7 @@ def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | Non
     if not plan.artifacts:
         log.warning("No artifacts resolved")
         complete_marker.touch()
-        sys.path.insert(0, str(site_packages))
+        _activate_env(site_packages)
         return venv, site_packages, plan, None, [], None
 
     log.info(
@@ -428,7 +451,7 @@ def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | Non
         len(plan.fast_wheels),
     )
 
-    sys.path.insert(0, str(site_packages))
+    _activate_env(site_packages)
 
     # Install only SMALL wheels via uv (fast, metadata-sensitive)
     # Large wheels go through the daemon for streaming extraction
@@ -546,6 +569,7 @@ def run(
     script: str,
     requirements: list[str] | None = None,
     requirements_file: str | None = None,
+    accelerate_opts: dict[str, str | None] | None = None,
 ) -> None:
     """Run a Python script with lazy imports and progressive installation."""
     if requirements is None:
@@ -562,10 +586,16 @@ def run(
 
     if not requirements:
         log.warning("No requirements found — running script directly")
+        if accelerate_opts is not None:
+            _activate_accelerate(accelerate_opts)
         exec(compile(open(script).read(), script, "exec"), {"__name__": "__main__"})
         return
 
     venv, site_packages, plan, daemon, whl_paths, uv_thread = prepare_env(requirements)
+
+    # Enable accelerate AFTER env is ready so we import the correct torch
+    if accelerate_opts is not None:
+        _activate_accelerate(accelerate_opts)
 
     if not daemon:
         # Warm path or all-uv — just run
@@ -590,6 +620,7 @@ def run_package(
     package: str,
     args: list[str] | None = None,
     extra_packages: list[str] | None = None,
+    accelerate_opts: dict[str, str | None] | None = None,
 ) -> None:
     """Install a package and run its console_script entry point."""
     if args is None:
@@ -600,6 +631,10 @@ def run_package(
         requirements.extend(extra_packages)
 
     venv, site_packages, plan, daemon, whl_paths, uv_thread = prepare_env(requirements)
+
+    # Enable accelerate AFTER env is ready so we import the correct torch
+    if accelerate_opts is not None:
+        _activate_accelerate(accelerate_opts)
 
     if plan and not (venv / ".complete").exists():
         # Wait for the target package's metadata to be on disk
@@ -677,9 +712,12 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    # NOTE: accelerate() must be called AFTER prepare_env() sets up the
+    # environment, otherwise it imports system torch (which may be older)
+    # and caches it in sys.modules before the zerostart env is on sys.path.
+    accelerate_opts = None
     if args.accelerate:
-        from zerostart.accelerate import accelerate
-        accelerate(cache_dir=args.model_cache_dir)
+        accelerate_opts = {"cache_dir": args.model_cache_dir}
 
     if _is_script(args.target):
         sys.argv = [args.target] + args.target_args
@@ -687,12 +725,14 @@ def main() -> None:
             script=args.target,
             requirements=args.packages,
             requirements_file=args.requirements,
+            accelerate_opts=accelerate_opts,
         )
     else:
         run_package(
             package=args.target,
             args=args.target_args,
             extra_packages=args.packages,
+            accelerate_opts=accelerate_opts,
         )
 
 

@@ -34,6 +34,20 @@ Warm starts are where zerostart consistently wins regardless of network speed. u
 
 All measured on RunPod (RTX 4090 / A6000).
 
+### End-to-End: Install + Download + Load Model
+
+Full cold-to-inference benchmark with Qwen3.5-35B-A3B (34.7B params, MoE) on RTX A6000:
+
+| Test | Description | Time |
+|------|-------------|------|
+| Baseline full cold | uv install + HF download + model load | 349s |
+| Baseline warm | uv cached + HF cached | 59s |
+| zerostart full cold | install + HF download + model load | 428s |
+| **zerostart warm** | **env cached + HF cached** | **15s** |
+| zerostart cold install | env rebuild, uv cached | 98s |
+
+The big win is warm starts: **15s vs 59s** (4x faster). uv re-resolves and re-links 53 packages on every run; zerostart checks a cache marker and runs immediately. For full cold starts, HF model download (~270s) dominates both paths.
+
 ## How It Works
 
 ### Cold starts: parallel Range-request streaming
