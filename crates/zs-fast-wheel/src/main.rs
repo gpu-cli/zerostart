@@ -168,9 +168,9 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// Parallel downloads (default 16). Set ZS_PARALLEL_DOWNLOADS to tune.
+/// Parallel downloads (default 32). Set ZS_PARALLEL_DOWNLOADS to tune.
 fn configured_parallel_downloads() -> usize {
-    env_usize("ZS_PARALLEL_DOWNLOADS", 16)
+    env_usize("ZS_PARALLEL_DOWNLOADS", 32)
 }
 
 /// Extraction threads (default num_cpus * 2). Set ZS_EXTRACT_THREADS to tune.
@@ -379,6 +379,148 @@ else:
 
     eprintln!("exec failed: {err}");
     std::process::exit(1);
+}
+
+/// Spawn Python as a child process, run cache population in background, wait for child.
+/// Used when we need to populate the shared cache concurrently with script execution.
+fn spawn_python_with_cache(
+    python: &std::path::Path,
+    site_packages: &std::path::Path,
+    target: &str,
+    target_args: &[String],
+    _cache_handle: Option<tokio::task::JoinHandle<()>>,
+) -> ! {
+    let mut pythonpath = site_packages.to_string_lossy().to_string();
+    if let Ok(existing) = std::env::var("PYTHONPATH") {
+        pythonpath = format!("{pythonpath}:{existing}");
+    }
+
+    let sp_str = site_packages.display().to_string();
+    let args_str = format!("{target_args:?}");
+
+    // Same entry-point-discovery script as exec_python
+    let script = format!(
+        r#"
+import sys, os, re, importlib, subprocess
+from pathlib import Path
+from configparser import ConfigParser
+
+sp = {sp_repr}
+target = {target_repr}
+args = {args_repr}
+sys.path.insert(0, sp)
+
+if target.endswith('.py') or Path(target).is_file():
+    sys.argv = [target] + args
+    exec(compile(open(target).read(), target, 'exec'),
+         {{'__name__': '__main__', '__file__': target}})
+else:
+    site = Path(sp)
+    norm = re.sub(r'[-_.]+', '-', target).lower()
+    dist_info = None
+    for d in site.glob('*.dist-info'):
+        stem = d.name.removesuffix('.dist-info')
+        m = re.match(r'^(.+?)-\d', stem)
+        pkg = m.group(1) if m else stem
+        if re.sub(r'[-_.]+', '-', pkg).lower() == norm:
+            dist_info = d
+            break
+    ep = None
+    if dist_info:
+        ep_file = dist_info / 'entry_points.txt'
+        if ep_file.exists():
+            cp = ConfigParser()
+            cp.read_string(ep_file.read_text())
+            if cp.has_section('console_scripts'):
+                items = list(cp.items('console_scripts'))
+                if len(items) == 1:
+                    ep = items[0]
+                else:
+                    for name, spec in items:
+                        if re.sub(r'[-_.]+', '-', name).lower() == norm:
+                            ep = (name, spec)
+                            break
+                    if not ep:
+                        ep = items[0]
+    if ep:
+        name, spec = ep
+        module_name, _, attr_name = spec.partition(':')
+        sys.argv = [name] + args
+        mod = importlib.import_module(module_name.strip())
+        obj = mod
+        for part in attr_name.strip().split('.'):
+            obj = getattr(obj, part)
+        obj()
+    else:
+        found = None
+        for data_dir in site.glob('*.data'):
+            dn = data_dir.name.removesuffix('.data') + '.dist-info'
+            m2 = re.match(r'^(.+?)-\d', dn.removesuffix('.dist-info'))
+            pkg2 = m2.group(1) if m2 else dn.removesuffix('.dist-info')
+            if re.sub(r'[-_.]+', '-', pkg2).lower() != norm:
+                continue
+            scripts = data_dir / 'scripts'
+            if scripts.is_dir():
+                for f in scripts.iterdir():
+                    if f.is_file() and os.access(f, os.X_OK):
+                        found = f
+                        if re.sub(r'[-_.]+', '-', f.name).lower() == norm:
+                            break
+            if found:
+                break
+        if found:
+            r = subprocess.run([str(found)] + args)
+            sys.exit(r.returncode)
+        else:
+            try:
+                from importlib.metadata import distribution
+                dist = distribution(target)
+                for e in dist.entry_points:
+                    if e.group == 'console_scripts':
+                        module_name, _, attr_name = e.value.partition(':')
+                        sys.argv = [e.name] + args
+                        mod = importlib.import_module(module_name.strip())
+                        obj = mod
+                        for part in attr_name.strip().split('.'):
+                            obj = getattr(obj, part)
+                        obj()
+                        sys.exit(0)
+            except Exception:
+                pass
+            print(f"Error: no entry point found for '{{target}}'", file=sys.stderr)
+            sys.exit(1)
+"#,
+        sp_repr = format!("'{}'", sp_str.replace('\'', "\\'")),
+        target_repr = format!("'{}'", target.replace('\'', "\\'")),
+        args_repr = args_str,
+    );
+
+    // Spawn Python as child (not exec) so we can continue cache work
+    let mut child = match std::process::Command::new(python)
+        .env("PYTHONPATH", &pythonpath)
+        .arg("-c")
+        .arg(&script)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to spawn Python: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Wait for child and cache handle concurrently
+    // The cache_handle is on the tokio runtime which is still alive
+    let status = child.wait().unwrap_or_else(|e| {
+        eprintln!("Failed to wait for Python: {e}");
+        std::process::exit(1);
+    });
+
+    // Don't wait for cache population — it's best-effort for future cold starts.
+    // The script has already finished; exit with its status code.
+    // Note: std::process::exit() will kill the cache thread, but that's OK —
+    // partial cache is still useful and next cold start fills the rest.
+    std::process::exit(status.code().unwrap_or(1));
 }
 
 /// Create a venv using uv if it doesn't exist.
@@ -854,6 +996,9 @@ async fn main() -> Result<()> {
             }
 
             // === COLD PATH — all in Rust ===
+            let mut needs_cache_populate = false;
+            let mut cache_handle: Option<tokio::task::JoinHandle<()>> = None;
+
             if verbose {
                 eprintln!("Cache miss — resolving...");
             }
@@ -979,13 +1124,14 @@ async fn main() -> Result<()> {
                         );
                     }
 
-                    // Populate shared cache for newly extracted wheels
-                    // Skip if ZS_NO_SHARED_CACHE=1 or disk is tight (<2GB free)
+                    // Schedule shared cache population — runs in background while script executes.
+                    // Skip if ZS_NO_SHARED_CACHE=1.
                     if std::env::var("ZS_NO_SHARED_CACHE").is_ok() {
                         tracing::info!("Shared cache disabled via ZS_NO_SHARED_CACHE");
                     } else {
+                        needs_cache_populate = true;
                         let sp_for_cache = site_packages.clone();
-                        tokio::task::spawn_blocking(move || {
+                        cache_handle = Some(tokio::task::spawn_blocking(move || {
                             if let Ok(avail) = available_disk_mb(&sp_for_cache) {
                                 if avail < 2048 {
                                     tracing::warn!(
@@ -998,8 +1144,7 @@ async fn main() -> Result<()> {
                             for spec in &wheels_to_cache {
                                 populate_shared_cache(spec, &sp_for_cache);
                             }
-                        })
-                        .await?;
+                        }));
                     }
                 }
             }
@@ -1017,7 +1162,14 @@ async fn main() -> Result<()> {
                 eprintln!("Environment ready — starting {target}");
             }
 
-            exec_python(&python, &site_packages, &target, &target_args);
+            // If we have background cache work, spawn Python as child process
+            // so cache population can continue while the script runs.
+            // Otherwise, exec directly (more efficient, preserves signals).
+            if needs_cache_populate {
+                spawn_python_with_cache(&python, &site_packages, &target, &target_args, cache_handle);
+            } else {
+                exec_python(&python, &site_packages, &target, &target_args);
+            }
         }
 
         Command::Install {

@@ -34,7 +34,6 @@ import re
 import shutil
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -343,6 +342,7 @@ def _start_daemon(plan: ArtifactPlan, site_packages: Path, wheel_cache_dir: Path
         daemon.start(
             wheels=wheels,
             site_packages=str(site_packages),
+            parallel_downloads=32,
         )
 
         log.info("[daemon] Started via PyO3 for %d large packages", len(plan.fast_wheels))
@@ -411,13 +411,13 @@ def _start_daemon(plan: ArtifactPlan, site_packages: Path, wheel_cache_dir: Path
 # Core: prepare environment
 # ---------------------------------------------------------------------------
 
-def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | None, object | None, list[Path], threading.Thread | None]:
+def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | None, object | None, list[Path]]:
     """Prepare environment for running.
 
-    Returns (venv, site_packages, plan, daemon, whl_paths, uv_thread).
+    Returns (venv, site_packages, plan, daemon, whl_paths).
 
-    WARM path: uv pip install is instant from cache. No daemon.
-    COLD path: uv handles small wheels, daemon streams large wheels.
+    WARM path: cache hit, exec immediately.
+    COLD path: daemon downloads and extracts all wheels in parallel.
     """
     uv = _find_uv()
     venv = _get_or_create_venv(requirements)
@@ -432,7 +432,7 @@ def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | Non
     if complete_marker.exists():
         log.info("Cache hit — environment ready")
         _activate_env(site_packages)
-        return venv, site_packages, None, None, [], None
+        return venv, site_packages, None, None, []
 
     # Cold path: resolve to figure out which wheels need daemon
     log.info("Resolving %d requirements...", len(requirements))
@@ -442,30 +442,16 @@ def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | Non
         log.warning("No artifacts resolved")
         complete_marker.touch()
         _activate_env(site_packages)
-        return venv, site_packages, plan, None, [], None
+        return venv, site_packages, plan, None, []
 
     log.info(
-        "Resolved: %d packages (%d small via uv, %d large via daemon)",
+        "Resolved: %d packages via daemon",
         len(plan.artifacts),
-        len(plan.uv_wheels),
-        len(plan.fast_wheels),
     )
 
     _activate_env(site_packages)
 
-    # Install only SMALL wheels via uv (fast, metadata-sensitive)
-    # Large wheels go through the daemon for streaming extraction
-    uv_thread = None
-    small_specs = [f"{w.distribution}=={w.version}" for w in plan.uv_wheels]
-    if small_specs:
-        uv_thread = threading.Thread(
-            target=_run_uv_install,
-            args=(venv, small_specs),
-            daemon=True,
-        )
-        uv_thread.start()
-
-    # Start daemon for large wheels (streams in parallel with uv)
+    # All wheels go through the daemon for parallel download + extraction
     wheel_cache = ENV_CACHE_DIR / "wheels"
     daemon, whl_paths = _start_daemon(plan, site_packages, wheel_cache)
 
@@ -473,22 +459,13 @@ def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | Non
     # doesn't support per-package tracking, so we wait for it to finish below)
     is_subprocess_daemon = isinstance(daemon, DaemonProcess) if daemon else False
     if daemon and not is_subprocess_daemon:
-        daemon_dists = {w.distribution for w in plan.fast_wheels}
         daemon_import_map = {
             k: v for k, v in plan.import_to_distribution.items()
-            if v in daemon_dists
         }
         install_hook(
             daemon=daemon,
             import_map=daemon_import_map,
         )
-
-    # Always wait for uv to finish — small packages aren't covered by
-    # the lazy import hook, so they must be on disk before the script starts
-    if uv_thread:
-        log.info("Waiting for uv to finish...")
-        uv_thread.join(timeout=120)
-        uv_thread = None
 
     # Subprocess daemon: wait for ALL wheels to finish before running script.
     # Unlike PyO3 daemon, subprocess can't track per-package progress.
@@ -506,7 +483,7 @@ def prepare_env(requirements: list[str]) -> tuple[Path, Path, ArtifactPlan | Non
     if not daemon:
         complete_marker.touch()
 
-    return venv, site_packages, plan, daemon, whl_paths, uv_thread
+    return venv, site_packages, plan, daemon, whl_paths
 
 
 def _run_uv_install(venv: Path, specs: list[str]) -> None:
@@ -524,18 +501,14 @@ def cleanup(
     venv: Path,
     plan: ArtifactPlan | None,
     daemon: object | None,
-    uv_thread: threading.Thread | None,
     whl_paths: list[Path],
     t0: float,
 ) -> None:
-    """Cleanup: wait for daemon/uv, mark complete, populate uv cache."""
+    """Cleanup: wait for daemon, mark complete, populate uv cache."""
     total = time.monotonic() - t0
     log.info("Finished in %.1fs", total)
 
     report = remove_hook()
-
-    if uv_thread:
-        uv_thread.join(timeout=30)
 
     if daemon:
         try:
@@ -591,14 +564,14 @@ def run(
         exec(compile(open(script).read(), script, "exec"), {"__name__": "__main__"})
         return
 
-    venv, site_packages, plan, daemon, whl_paths, uv_thread = prepare_env(requirements)
+    venv, site_packages, plan, daemon, whl_paths = prepare_env(requirements)
 
     # Enable accelerate AFTER env is ready so we import the correct torch
     if accelerate_opts is not None:
         _activate_accelerate(accelerate_opts)
 
     if not daemon:
-        # Warm path or all-uv — just run
+        # Warm path — just run
         exec(compile(open(script).read(), script, "exec"), {"__name__": "__main__"})
         return
 
@@ -609,7 +582,7 @@ def run(
         script_globals = {"__name__": "__main__", "__file__": script}
         exec(compile(open(script).read(), script, "exec"), script_globals)
     finally:
-        cleanup(venv, plan, daemon, uv_thread, whl_paths, t0)
+        cleanup(venv, plan, daemon, whl_paths, t0)
 
 
 # ---------------------------------------------------------------------------
@@ -630,7 +603,7 @@ def run_package(
     if extra_packages:
         requirements.extend(extra_packages)
 
-    venv, site_packages, plan, daemon, whl_paths, uv_thread = prepare_env(requirements)
+    venv, site_packages, plan, daemon, whl_paths = prepare_env(requirements)
 
     # Enable accelerate AFTER env is ready so we import the correct torch
     if accelerate_opts is not None:
@@ -641,7 +614,6 @@ def run_package(
         pkg_normalized = re.sub(r"[-_.]+", "-", package.split("[")[0]).lower()
 
         if daemon:
-            # Find the exact distribution name the daemon is tracking
             daemon_dist = next(
                 (w.distribution for w in plan.fast_wheels
                  if re.sub(r"[-_.]+", "-", w.distribution).lower() == pkg_normalized),
@@ -650,14 +622,6 @@ def run_package(
             if daemon_dist:
                 log.info("Waiting for %s metadata (daemon)...", daemon_dist)
                 daemon.wait_done(daemon_dist, timeout_secs=120.0)
-            elif uv_thread:
-                log.info("Waiting for %s metadata (uv)...", package)
-                uv_thread.join(timeout=120)
-                uv_thread = None
-        elif uv_thread:
-            log.info("Waiting for %s metadata (uv)...", package)
-            uv_thread.join(timeout=120)
-            uv_thread = None
 
     # Discover entry point
     try:
@@ -677,7 +641,7 @@ def run_package(
     try:
         invoke_entry_point(ep, args)
     finally:
-        cleanup(venv, plan, daemon, uv_thread, whl_paths, t0)
+        cleanup(venv, plan, daemon, whl_paths, t0)
 
 
 # ---------------------------------------------------------------------------

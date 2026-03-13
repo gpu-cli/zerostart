@@ -34,19 +34,19 @@ Warm starts are where zerostart consistently wins regardless of network speed. u
 
 All measured on RunPod (RTX 4090 / A6000).
 
-### End-to-End: Install + Download + Load Model
+### End-to-End: Install + Download + Load Model + Inference
 
-Full cold-to-inference benchmark with Qwen3.5-35B-A3B (34.7B params, MoE) on RTX A6000:
+Full cold-to-inference benchmark with Qwen3.5-35B-A3B (34.7B params, MoE) on RTX A6000. Includes 20-token generation to verify correct model loading. Each variant runs on its own isolated pod with HF cache cleared for fair cold-start comparison.
 
-| Test | Description | Time |
-|------|-------------|------|
-| Baseline full cold | uv install + HF download + model load | 349s |
-| Baseline warm | uv cached + HF cached | 59s |
-| zerostart full cold | install + HF download + model load | 428s |
-| **zerostart warm** | **env cached + HF cached** | **15s** |
-| zerostart cold install | env rebuild, uv cached | 98s |
+| Test | Baseline (uv) | zerostart | Notes |
+|------|---------------|-----------|-------|
+| **Full cold** | 569s | 642s | HF download (~7 min) dominates both paths |
+| **Warm** | 144s | **128s** | zerostart 11% faster — accelerate() eliminates import overhead |
+| **Cold install** (HF cached) | — | 182s | Realistic "second deploy" scenario |
 
-The big win is warm starts: **15s vs 59s** (4x faster). uv re-resolves and re-links 53 packages on every run; zerostart checks a cache marker and runs immediately. For full cold starts, HF model download (~270s) dominates both paths.
+**Where zerostart wins (warm path):** torch import 0.0s vs 3.4s, transformers import 0.1s vs 5.8s, model load 35s vs 40s. `accelerate()` patches `from_pretrained` to skip random weight init and use direct safetensors loading.
+
+**Where baseline wins (cold path):** uv installs faster (42s vs 60s) when installing alone — zerostart's daemon and uv compete for bandwidth. HF model download time varies by pod (~6.5 min vs ~7.4 min). For full cold starts, the 7-minute HF download dwarfs any install optimization.
 
 ## How It Works
 

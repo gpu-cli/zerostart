@@ -30,7 +30,7 @@ impl DaemonHandle {
     }
 
     /// Start the daemon with the given wheel specs.
-    #[pyo3(signature = (wheels, site_packages, parallel_downloads=8, extract_threads=0))]
+    #[pyo3(signature = (wheels, site_packages, parallel_downloads=32, extract_threads=0))]
     fn start(
         &mut self,
         wheels: Vec<Bound<'_, PyDict>>,
@@ -71,7 +71,7 @@ impl DaemonHandle {
         let handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
-                .worker_threads(2.max(parallel_downloads / 2))
+                .worker_threads(4.max(parallel_downloads))
                 .build()
                 .expect("failed to create tokio runtime");
 

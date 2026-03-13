@@ -7,7 +7,7 @@ name = "zerostart"
 version = "0.1.0"
 description = "Fast Python package runner with progressive loading — like uvx but with streaming extraction"
 requires-python = ">=3.10"
-readme = "../README.md"
+readme = "README.md"
 license = "MIT"
 authors = [{ name = "gpu-cli" }]
 keywords = ["python", "gpu", "cold-start", "wheel", "package-manager"]

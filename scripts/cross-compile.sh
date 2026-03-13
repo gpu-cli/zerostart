@@ -27,6 +27,15 @@ chmod +x "$OUTDIR/zerostart-linux-x86_64"
 cp "crates/target/$TARGET/release/zerostart" "$OUTDIR/zs-fast-wheel-linux-x86_64"
 chmod +x "$OUTDIR/zs-fast-wheel-linux-x86_64"
 
+# Copy to bench directories that have their own bin/
+for benchdir in benches/*/bin; do
+    if [ -d "$benchdir" ]; then
+        cp "$OUTDIR/zerostart-linux-x86_64" "$benchdir/"
+        cp "$OUTDIR/zs-fast-wheel-linux-x86_64" "$benchdir/"
+        echo "Also copied to $benchdir/"
+    fi
+done
+
 echo ""
 echo "Done. Binaries in $OUTDIR/:"
 ls -lh "$OUTDIR/"*-linux-x86_64

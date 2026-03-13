@@ -18,8 +18,10 @@ use crate::manifest::WheelSpec;
 use crate::queue::InstallQueue;
 use crate::streaming;
 
-/// Streaming threshold: wheels above this size use Range request streaming
-const STREAM_THRESHOLD: u64 = 50 * 1024 * 1024; // 50MB
+/// Streaming threshold: wheels above this size use Range request streaming.
+/// Streaming overlaps download+extraction via chunked Range requests, which
+/// is faster than downloading the entire file before extracting.
+const STREAM_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MB
 
 /// Configuration for the daemon engine.
 pub struct DaemonConfig {
@@ -32,7 +34,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             site_packages: PathBuf::from("site-packages"),
-            parallel_downloads: 8,
+            parallel_downloads: 32,
             extract_threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
@@ -149,7 +151,7 @@ impl DaemonEngine {
                         &wheel.url,
                         &site_packages,
                         &dist,
-                        4,
+                        8,
                         &stats,
                     )
                     .await

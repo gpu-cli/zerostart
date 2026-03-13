@@ -1,0 +1,26 @@
+{
+  "$schema": "https://gpu-cli.sh/schema/v1/gpu.json",
+  "project_id": "zs-bench-zerostart",
+  "gpu_types": [
+    { "type": "RTX A6000" }
+  ],
+  "min_vram": 24,
+  "storage_mode": "built-in",
+  "workspace_size_gb": 200,
+  "include": ["bench.sh", "bench_torch.sh", "bench_progressive.sh", "bench_inference.sh", "inference_server.py", "serve.py", "torch_only.py", "bin/", "python/"],
+  "outputs": ["results.txt"],
+  "environment": {
+    "system": {
+      "apt": [{ "name": "curl" }]
+    },
+    "shell": {
+      "steps": [
+        { "run": "curl -LsSf https://astral.sh/uv/install.sh | sh" },
+        { "run": "chmod +x bin/*-linux-x86_64 2>/dev/null || true" },
+        { "run": "pip install -q python/ 2>&1 | tail -1" }
+      ]
+    }
+  },
+  "keep_alive_minutes": 30,
+  "volume_mode": "none"
+}
