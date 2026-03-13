@@ -337,7 +337,9 @@ fn parse_pylock(content: &str) -> Result<Vec<WheelSpec>> {
 /// If multiple, prefer the first (uv orders by preference).
 fn pick_best_wheel(wheels: &[toml::Value]) -> Option<(String, u64, Option<String>)> {
     for wheel in wheels {
-        let url = wheel.get("url").and_then(|v| v.as_str())?;
+        let Some(url) = wheel.get("url").and_then(|v| v.as_str()) else {
+            continue;
+        };
         let size = wheel
             .get("size")
             .and_then(|v| v.as_integer())

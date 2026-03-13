@@ -5,7 +5,6 @@ pub mod manifest;
 pub mod pipeline;
 pub mod queue;
 pub mod resolve;
-pub mod streaming;
 
 #[cfg(feature = "python")]
 pub mod pymodule;

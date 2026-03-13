@@ -21,10 +21,10 @@ struct Cli {
 enum Command {
     /// Run a Python package or script with fast installation
     ///
-    /// Like uvx but with streaming wheel extraction for large packages.
+    /// Fast parallel wheel installation with GET+pipeline architecture.
     /// Checks cache in Rust for instant warm starts.
-    /// Cold path: resolves via uv, installs small wheels via uv,
-    /// streams large wheels via daemon — all in Rust, no Python orchestrator.
+    /// Cold path: resolves via uv, downloads full wheels via single GET,
+    /// pipelines download+extraction — all in Rust, no Python orchestrator.
     ///
     /// Examples:
     ///   zerostart run comfyui
@@ -68,10 +68,6 @@ enum Command {
         /// Number of parallel extraction threads
         #[arg(short = 'x', long, default_value_t = num_cpus())]
         extract_threads: usize,
-
-        /// Use streaming mode
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
-        stream: bool,
 
         /// Pre-allocate files with fallocate
         #[arg(long, default_value_t = true)]
@@ -1028,7 +1024,7 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // Run uv sdist install + daemon streaming in parallel
+            // Run uv sdist install + daemon download+extract in parallel
             let uv_specs = plan.uv_specs.clone();
             let env_dir_clone = env_dir.clone();
             let uv_verbose = verbose;
@@ -1177,7 +1173,6 @@ async fn main() -> Result<()> {
             target,
             parallel_downloads,
             extract_threads,
-            stream,
             fallocate,
             batch_sync,
             benchmark,
@@ -1188,7 +1183,6 @@ async fn main() -> Result<()> {
                 target,
                 parallel_downloads,
                 extract_threads,
-                use_stream: stream,
                 use_fallocate: fallocate,
                 batch_sync,
                 benchmark,

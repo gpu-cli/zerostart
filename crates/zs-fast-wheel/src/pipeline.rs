@@ -1,6 +1,5 @@
 use crate::download::{self, DownloadedWheel};
 use crate::extract::{self, ExtractStats};
-use crate::streaming;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
@@ -12,7 +11,6 @@ pub struct PipelineConfig {
     pub target: PathBuf,
     pub parallel_downloads: usize,
     pub extract_threads: usize,
-    pub use_stream: bool,
     pub use_fallocate: bool,
     pub batch_sync: bool,
     pub benchmark: bool,
@@ -43,112 +41,7 @@ pub async fn run(wheels: Vec<String>, config: PipelineConfig) -> Result<()> {
         }
     }
 
-    // Streaming mode: use Range requests to overlap download+extract for URLs
-    if config.use_stream && !urls.is_empty() {
-        let client = reqwest::Client::builder()
-            .pool_max_idle_per_host(config.parallel_downloads)
-            .build()?;
-
-        // Process each URL with streaming extraction (all entries in parallel)
-        let mut handles = Vec::new();
-        for url in &urls {
-            let client = client.clone();
-            let url = url.clone();
-            let target = config.target.clone();
-            let stats = stats.clone();
-            let parallel = config.parallel_downloads;
-
-            let handle = tokio::spawn(async move {
-                let start = std::time::Instant::now();
-                let result =
-                    streaming::stream_extract_wheel(&client, &url, &target, parallel, &stats)
-                        .await;
-                let elapsed = start.elapsed().as_millis();
-                (url, result, elapsed)
-            });
-            handles.push(handle);
-        }
-
-        let mut total_downloaded: u64 = 0;
-        for handle in handles {
-            let (url, result, elapsed) = handle.await?;
-            match result {
-                Ok((downloaded, _total_size)) => {
-                    total_downloaded += downloaded;
-                    if config.benchmark {
-                        let short = url.rsplit('/').next().unwrap_or(&url);
-                        eprintln!("  [{short}] streamed in {elapsed}ms");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  streaming failed for {url}: {e}");
-                    eprintln!("  falling back to download+extract...");
-                    // Fallback: download whole file then extract
-                    let (tx, mut rx) = mpsc::channel::<DownloadedWheel>(1);
-                    let tmp_dir = tempfile::tempdir()?;
-                    download::download_wheels(
-                        vec![url],
-                        tmp_dir.path(),
-                        1,
-                        tx,
-                    )
-                    .await?;
-                    if let Some(wheel) = rx.recv().await {
-                        total_downloaded += wheel.size;
-                        extract::extract_wheel(
-                            &wheel.path,
-                            &config.target,
-                            config.extract_threads,
-                            config.use_fallocate,
-                            &stats,
-                        )?;
-                    }
-                }
-            }
-        }
-
-        // Also extract local wheels
-        for wheel in &local_wheels {
-            extract::extract_wheel(
-                &wheel.path,
-                &config.target,
-                config.extract_threads,
-                config.use_fallocate,
-                &stats,
-            )?;
-        }
-
-        // Sync
-        if config.batch_sync {
-            do_syncfs(&config.target);
-        }
-
-        let total_ms = total_start.elapsed().as_millis();
-        let files = stats.files_written.load(Ordering::Relaxed);
-        let bytes = stats.bytes_written.load(Ordering::Relaxed);
-        let dirs = stats.dirs_created.load(Ordering::Relaxed);
-
-        eprintln!();
-        eprintln!("--- fast-wheel summary (streaming) ---");
-        eprintln!(
-            "Wheels: {} ({:.1} MB transferred)",
-            urls.len() + local_wheels.len(),
-            total_downloaded as f64 / 1024.0 / 1024.0
-        );
-        eprintln!(
-            "Extracted: {files} files, {dirs} dirs ({:.1} MB)",
-            bytes as f64 / 1024.0 / 1024.0
-        );
-        eprintln!("Total time: {total_ms}ms");
-        if total_ms > 0 {
-            let throughput = bytes as f64 / 1024.0 / 1024.0 / (total_ms as f64 / 1000.0);
-            eprintln!("Throughput: {throughput:.0} MB/s");
-        }
-
-        return Ok(());
-    }
-
-    // Non-streaming mode: download whole files then extract
+    // Download whole files then extract (GET+pipeline)
     let (tx, mut rx) = mpsc::channel::<DownloadedWheel>(config.parallel_downloads * 2);
 
     for w in local_wheels {

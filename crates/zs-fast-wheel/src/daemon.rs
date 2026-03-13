@@ -1,12 +1,17 @@
-//! DaemonEngine: in-memory wheel installation engine.
+//! DaemonEngine: GET+pipeline wheel installation engine.
 //!
-//! Core state is all in-memory — completion tracking, demand signaling,
-//! and stats use Arc+Mutex+Condvar. No file-based IPC, no tokio sync
-//! primitives (so it works across separate tokio runtimes).
+//! Downloads full wheels via single GET requests (maximizing bandwidth),
+//! then extracts each wheel immediately as it finishes downloading.
+//! This pipelines download and extraction: while wheel N extracts,
+//! wheels N+1..N+K are still downloading.
 //!
-//! Used by both the CLI and PyO3 bindings.
+//! Total time ≈ max(download_time, extract_time) instead of sum.
+//!
+//! All completion state is in-memory — Arc+Mutex+Condvar for cross-runtime
+//! wake. Used by both the CLI and PyO3 bindings.
 
 use anyhow::{Context, Result};
+use futures::StreamExt;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -16,12 +21,6 @@ use std::time::{Duration, Instant};
 use crate::extract::{self, cleanup_stale_staging, ExtractStats};
 use crate::manifest::WheelSpec;
 use crate::queue::InstallQueue;
-use crate::streaming;
-
-/// Streaming threshold: wheels above this size use Range request streaming.
-/// Streaming overlaps download+extraction via chunked Range requests, which
-/// is faster than downloading the entire file before extracting.
-const STREAM_THRESHOLD: u64 = 5 * 1024 * 1024; // 5MB
 
 /// Configuration for the daemon engine.
 pub struct DaemonConfig {
@@ -58,11 +57,16 @@ struct CompletionState {
     all_finished: bool,
 }
 
+/// A downloaded wheel ready for extraction.
+struct DownloadedWheel {
+    spec: WheelSpec,
+    path: PathBuf,
+}
+
 /// In-memory engine that downloads and extracts wheels progressively.
 ///
-/// All state is in-memory. Use `signal_demand()` to prioritize a package,
-/// `is_done()` / `wait_done()` to check completion, `wait_all()` to block
-/// until everything finishes.
+/// Downloads full wheels via single GET (maximize bandwidth), extracts each
+/// immediately as it finishes (pipeline download + extraction).
 pub struct DaemonEngine {
     queue: Arc<Mutex<InstallQueue>>,
     /// Completion tracking — protected by Mutex + Condvar for cross-runtime wake
@@ -99,7 +103,10 @@ impl DaemonEngine {
 
     /// Start downloading and extracting all wheels. Returns when all are done.
     ///
-    /// Call this from a tokio runtime (or spawn on a background thread).
+    /// Architecture: GET+pipeline
+    /// - Download workers (tokio tasks): single GET per wheel → temp file → channel
+    /// - Extract worker (spawn_blocking): receives from channel → extract to site-packages
+    /// - Backpressure: channel capacity limits temp disk usage
     pub async fn run(&self, config: &DaemonConfig) -> Result<()> {
         let start = Instant::now();
 
@@ -114,9 +121,19 @@ impl DaemonEngine {
             .pool_max_idle_per_host(config.parallel_downloads)
             .build()?;
 
+        // Channel: downloaded wheels flow from download workers → extract worker.
+        // Small capacity (4) provides backpressure — if extraction is slow,
+        // downloads pause rather than filling disk with temp files.
+        let (tx, rx) = tokio::sync::mpsc::channel::<DownloadedWheel>(4);
+
+        let tmp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+        let tmp_path = tmp_dir.path().to_path_buf();
+
+        // === Download stage ===
+        // Spawn one task per wheel, bounded by semaphore.
+        // Each task: GET wheel → write to temp file → send through channel.
         let sem = Arc::new(tokio::sync::Semaphore::new(config.parallel_downloads));
-        let mut handles = Vec::new();
-        let total_wheels = self.total_wheels;
+        let mut download_handles = Vec::new();
 
         loop {
             let wheel = {
@@ -130,50 +147,85 @@ impl DaemonEngine {
             };
 
             let client = client.clone();
-            let site_packages = config.site_packages.clone();
-            let stats = self.stats.clone();
+            let tx = tx.clone();
             let sem = sem.clone();
-            let ext_threads = config.extract_threads;
-            let completion = self.completion.clone();
-            let queue = self.queue.clone();
+            let tmp_path = tmp_path.clone();
 
             let handle = tokio::spawn(async move {
                 let _permit = sem.acquire().await.context("semaphore closed")?;
 
                 let dist = wheel.distribution.clone();
-                let wheel_start = Instant::now();
+                let dl_start = Instant::now();
 
-                tracing::info!("[{dist}] starting download ({} bytes)", wheel.size);
+                tracing::info!("[{dist}] downloading ({} bytes)", wheel.size);
 
-                let result = if wheel.size >= STREAM_THRESHOLD {
-                    streaming::stream_extract_wheel_atomic(
-                        &client,
-                        &wheel.url,
-                        &site_packages,
-                        &dist,
-                        8,
-                        &stats,
-                    )
-                    .await
-                    .map(|_| ())
-                } else {
-                    download_and_extract_atomic(
-                        &client,
-                        &wheel.url,
-                        &site_packages,
-                        &dist,
-                        ext_threads,
-                        &stats,
-                    )
-                    .await
-                };
+                let result =
+                    download_wheel_to_file(&client, &wheel.url, &tmp_path, &dist).await;
+
+                match result {
+                    Ok(path) => {
+                        let elapsed = dl_start.elapsed();
+                        tracing::info!(
+                            "[{dist}] downloaded in {:.1}s",
+                            elapsed.as_secs_f64()
+                        );
+                        // Send to extract worker — blocks if channel is full (backpressure)
+                        tx.send(DownloadedWheel { spec: wheel, path })
+                            .await
+                            .ok();
+                    }
+                    Err(e) => {
+                        tracing::error!("[{dist}] download failed: {e:#}");
+                        // Return error info so we can mark it failed
+                        return Err(e);
+                    }
+                }
+
+                Ok::<String, anyhow::Error>(dist)
+            });
+
+            download_handles.push(handle);
+        }
+
+        // Drop our copy of tx so channel closes when all download tasks finish
+        drop(tx);
+
+        // === Extract stage ===
+        // Single blocking loop: receives downloaded wheels, extracts each immediately.
+        // Extraction uses all extract_threads for parallelism within a single wheel.
+        let site_packages = config.site_packages.clone();
+        let ext_threads = config.extract_threads;
+        let stats = self.stats.clone();
+        let completion = self.completion.clone();
+        let queue = self.queue.clone();
+        let total_wheels = self.total_wheels;
+
+        let extract_handle = tokio::task::spawn_blocking(move || {
+            let rx = rx;
+            // blocking_recv in a loop — channel closes when all downloads finish
+            let mut rx = rx;
+            while let Some(downloaded) = rx.blocking_recv() {
+                let dist = downloaded.spec.distribution.clone();
+                let extract_start = Instant::now();
+
+                let result = extract::extract_wheel_atomic(
+                    &downloaded.path,
+                    &site_packages,
+                    &dist,
+                    ext_threads,
+                    true,
+                    &stats,
+                );
 
                 let (lock, cvar) = &*completion;
 
                 match result {
                     Ok(()) => {
-                        let elapsed = wheel_start.elapsed();
-                        tracing::info!("[{dist}] done in {:.1}s", elapsed.as_secs_f64());
+                        let elapsed = extract_start.elapsed();
+                        tracing::info!(
+                            "[{dist}] extracted in {:.1}s",
+                            elapsed.as_secs_f64()
+                        );
 
                         {
                             let mut q = queue.lock().unwrap();
@@ -189,7 +241,7 @@ impl DaemonEngine {
                     }
                     Err(e) => {
                         let err_msg = format!("{e:#}");
-                        tracing::error!("[{dist}] failed: {err_msg}");
+                        tracing::error!("[{dist}] extraction failed: {err_msg}");
 
                         {
                             let mut q = queue.lock().unwrap();
@@ -205,17 +257,28 @@ impl DaemonEngine {
                     }
                 }
 
-                Ok::<_, anyhow::Error>(())
-            });
+                // Clean up temp file
+                let _ = std::fs::remove_file(&downloaded.path);
+            }
+        });
 
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            if let Err(e) = handle.await? {
-                tracing::error!("worker error: {e}");
+        // === Wait for download failures ===
+        // Collect download errors and mark them as failed
+        for handle in download_handles {
+            match handle.await {
+                Ok(Ok(_dist)) => {}
+                Ok(Err(e)) => {
+                    // Download failed — error already logged, but we need to mark completion
+                    tracing::error!("download worker error: {e}");
+                }
+                Err(e) => {
+                    tracing::error!("download task panicked: {e}");
+                }
             }
         }
+
+        // Wait for extract worker to finish
+        extract_handle.await?;
 
         // Mark all finished
         {
@@ -291,7 +354,6 @@ impl DaemonEngine {
                 return Ok(false);
             }
             if state.all_finished {
-                // All wheels done but this one isn't in done or failed — not in our set
                 return Ok(true);
             }
 
@@ -303,7 +365,6 @@ impl DaemonEngine {
             let (guard, timeout_result) = cvar.wait_timeout(state, remaining).unwrap();
             state = guard;
             if timeout_result.timed_out() {
-                // Check one more time
                 if state.done.contains(distribution) {
                     return Ok(true);
                 }
@@ -348,7 +409,6 @@ impl DaemonEngine {
         let done = state.done.len();
         let failed = state.failed.len();
         let pending_plus_in_progress = self.total_wheels.saturating_sub(done + failed);
-        // Approximate split — queue tracks the precise counts
         let q = self.queue.lock().unwrap();
         let pending = q.pending_count();
         let in_progress = pending_plus_in_progress.saturating_sub(pending);
@@ -373,34 +433,34 @@ impl DaemonEngine {
     }
 }
 
-/// Download a whole wheel file, then extract atomically.
-async fn download_and_extract_atomic(
+/// Download a single wheel via GET to a temp file.
+async fn download_wheel_to_file(
     client: &reqwest::Client,
     url: &str,
-    site_packages: &Path,
+    tmp_dir: &Path,
     pkg_name: &str,
-    threads: usize,
-    stats: &Arc<ExtractStats>,
-) -> Result<()> {
-    let tmp_dir = tempfile::tempdir().context("failed to create temp dir")?;
+) -> Result<PathBuf> {
     let filename = url.rsplit('/').next().unwrap_or("wheel.whl");
     let filename = urlencoding::decode(filename)
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| filename.to_string());
-    let dest = tmp_dir.path().join(&filename);
+    // Use pkg_name prefix to avoid collisions
+    let dest = tmp_dir.join(format!("{pkg_name}_{filename}"));
 
     let resp = client.get(url).send().await?.error_for_status()?;
-    let bytes = resp.bytes().await?;
-    tokio::fs::write(&dest, &bytes).await?;
 
-    let site_packages = site_packages.to_path_buf();
-    let pkg_name = pkg_name.to_string();
-    let stats = stats.clone();
+    // Stream to file — don't buffer entire wheel in memory
+    let mut stream = resp.bytes_stream();
+    let file = tokio::fs::File::create(&dest).await?;
+    let mut writer = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
 
-    tokio::task::spawn_blocking(move || {
-        extract::extract_wheel_atomic(&dest, &site_packages, &pkg_name, threads, true, &stats)
-    })
-    .await?
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        tokio::io::AsyncWriteExt::write_all(&mut writer, &chunk).await?;
+    }
+    tokio::io::AsyncWriteExt::flush(&mut writer).await?;
+
+    Ok(dest)
 }
 
 #[cfg(test)]
@@ -438,7 +498,6 @@ mod tests {
         ];
         let engine = DaemonEngine::new(wheels);
 
-        // Signal demand for torch — should move it to front
         engine.signal_demand("torch");
 
         let mut q = engine.queue.lock().unwrap();
@@ -467,7 +526,6 @@ mod tests {
             site_packages: PathBuf::from("/tmp/zs-test-empty-engine"),
             ..Default::default()
         };
-        // Should complete immediately
         engine.run(&config).await.unwrap();
         let _ = std::fs::remove_dir_all("/tmp/zs-test-empty-engine");
     }
@@ -475,7 +533,6 @@ mod tests {
     #[test]
     fn test_wait_done_not_in_set() {
         let engine = DaemonEngine::new(vec![]);
-        // Distribution not in our set — should return Ok(true) immediately
         let result = engine.wait_done("nonexistent", Duration::from_secs(1)).unwrap();
         assert!(result);
     }
