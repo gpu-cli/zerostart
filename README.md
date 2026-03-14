@@ -1,6 +1,6 @@
 # zerostart
 
-Parallel streaming wheel extraction for installing large Python packages on remote GPUs.
+Fast cold starts for Python GPU applications. Drop-in wrapper that installs packages in the background while your app starts running.
 
 ```bash
 zerostart run serve.py
@@ -10,21 +10,32 @@ Auto-detects dependencies from PEP 723 inline metadata, `pyproject.toml`, or `re
 
 ## Benchmarks
 
-### Cold Start (first run, empty cache)
+### Inference Server Cold Start
 
-Cold start speedup depends on pod network bandwidth. zerostart opens multiple parallel HTTP connections per wheel — this helps when a single connection can't saturate the link, but doesn't help when one connection already maxes out the pipe.
+Time-to-health-check for an inference server (torch + transformers + fastapi + uvicorn) on RTX A6000:
 
-| Pod network | Workload | zerostart | uv | Speedup |
-|-------------|----------|-----------|-----|---------|
-| Moderate (~200 Mbps) | torch (6.8 GB) | 33s | 98s | 3x |
-| Moderate (~200 Mbps) | triton (638 MB) | 3.4s | 1.0s | uv faster |
-| Fast (~1 Gbps) | diffusers+torch (7 GB) | 57s | 57s | ~1x |
+| Metric | uv | zerostart | Speedup |
+|--------|-----|-----------|---------|
+| Health check ready | 46s | **1.8s** | **25x** |
+| First CUDA inference | 55s | **33s** | 1.7x |
 
-On bandwidth-constrained pods (common with cheaper providers), parallel Range requests download large wheels 3x faster. On fast-network pods, a single connection already saturates the link and both tools finish in about the same time. For small packages, zerostart's startup overhead makes uv faster — just use uv directly.
+With progressive loading, your server accepts health probes in under 2 seconds while torch installs in the background. Kubernetes/load balancers see a healthy pod almost immediately.
+
+### AI Pipeline Cold Starts
+
+Cold start benchmarks across real AI workloads on RTX A6000:
+
+| Workload | uv | zerostart | Speedup |
+|----------|-----|-----------|---------|
+| Diffusion (torch+diffusers+transformers) | 51s | **40s** | 22% faster |
+| LLM Fine-tuning (torch+transformers+peft+trl) | 59s | **38s** | 36% faster |
+| Computer Vision (torch+torchvision+opencv) | 54s | **40s** | 26% faster |
+| Audio/Speech (torch+transformers+numpy) | 48s | **31s** | 35% faster |
+| Data Science (pandas+sklearn+xgboost) | 8s | 8s | ~1x |
 
 ### Warm Start (cached environment)
 
-Warm starts are where zerostart consistently wins regardless of network speed. uv re-resolves dependencies and rebuilds the environment on every invocation. zerostart checks a cache marker and exec's Python directly.
+Warm starts are where zerostart consistently wins. uv re-resolves and rebuilds the environment on every invocation. zerostart checks a cache marker and exec's Python directly.
 
 | Workload | zerostart | uv | Speedup |
 |----------|-----------|-----|---------|
@@ -34,51 +45,51 @@ Warm starts are where zerostart consistently wins regardless of network speed. u
 
 All measured on RunPod (RTX 4090 / A6000).
 
-### End-to-End: Install + Download + Load Model + Inference
-
-Full cold-to-inference benchmark with Qwen3.5-35B-A3B (34.7B params, MoE) on RTX A6000. Includes 20-token generation to verify correct model loading. Each variant runs on its own isolated pod with HF cache cleared for fair cold-start comparison.
-
-| Test | Baseline (uv) | zerostart | Notes |
-|------|---------------|-----------|-------|
-| **Full cold** | 569s | 642s | HF download (~7 min) dominates both paths |
-| **Warm** | 144s | **128s** | zerostart 11% faster — accelerate() eliminates import overhead |
-| **Cold install** (HF cached) | — | 182s | Realistic "second deploy" scenario |
-
-**Where zerostart wins (warm path):** torch import 0.0s vs 3.4s, transformers import 0.1s vs 5.8s, model load 35s vs 40s. `accelerate()` patches `from_pretrained` to skip random weight init and use direct safetensors loading.
-
-**Where baseline wins (cold path):** uv installs faster (42s vs 60s) when installing alone — zerostart's daemon and uv compete for bandwidth. HF model download time varies by pod (~6.5 min vs ~7.4 min). For full cold starts, the 7-minute HF download dwarfs any install optimization.
-
 ## How It Works
 
-### Cold starts: parallel Range-request streaming
+### Progressive loading
 
-uv downloads each wheel as a single HTTP connection. zerostart uses HTTP Range requests to download multiple chunks of each wheel in parallel, and starts extracting files while chunks are still arriving:
+Python starts immediately while packages install in the background. A lazy import hook blocks each `import` only until that specific package is extracted:
 
 ```
-uv (sequential per wheel):
-  torch.whl  [=========downloading=========>] then [==extracting==]
-  numpy.whl  [=====>] then [=]
+uv (sequential):
+  [====== install all packages ======] then [start Python]
+                                             46s to health check
 
-zerostart (parallel chunks, overlapped extraction):
-  torch.whl  chunk1 [====>]──extract──►
-             chunk2 [====>]──extract──►     ← 4 concurrent Range requests
-             chunk3 [====>]──extract──►       per large wheel
-             chunk4 [====>]──extract──►
-  numpy.whl  [=>]──extract──►               ← all wheels in parallel
+zerostart (progressive):
+  [start Python immediately]
+  import fastapi  → ready in 0.3s   → /health responding at 1.8s
+  import torch    → blocks 23s      → first inference at 33s
+  [======= packages installing in background =======]
 ```
 
-### Warm starts: Rust cache check vs re-resolve
+Small packages (fastapi, uvicorn) are available in under a second. Large packages (torch, transformers) block on import until extracted. Your app runs as soon as its first imports resolve.
 
-uv re-resolves dependencies and rebuilds the tool environment on every invocation — even when packages are cached. For vllm (177 packages), that means metadata checks and linking for each one.
+### GET+pipeline architecture
+
+Downloads full wheels via single GET requests (32 parallel connections), then pipelines extraction through 4 parallel workers. Biggest wheels download first to maximize overlap:
+
+```
+Download:  torch [==============>]  numpy [=>]  six [>]
+Extract:         [worker 0: torch ======>]
+                 [worker 1: numpy =>]
+                 [worker 2: six >]
+```
+
+### System CUDA detection
+
+On pods with CUDA pre-installed, zerostart detects the system CUDA version and skips downloading nvidia-* wheels when the system already provides compatible libraries. This saves ~2-6GB of downloads depending on the workload.
+
+### Shared CUDA layer cache
+
+CUDA libraries (nvidia-cublas, nvidia-cudnn, nvidia-nccl, etc.) are ~6GB and identical across torch, vllm, and diffusers environments. zerostart caches extracted wheels and hardlinks them into new environments — so the second torch-based environment skips re-extracting those 6GB.
+
+### Warm starts: Rust cache check
 
 zerostart's warm path is three operations in Rust:
 1. `stat(".complete")` — does the cached environment exist?
 2. `find("lib/python*/site-packages")` — locate it
 3. `exec(python)` — run directly
-
-### Shared CUDA layer cache
-
-CUDA libraries (nvidia-cublas, nvidia-cudnn, nvidia-nccl, etc.) are ~6GB and identical across torch, vllm, and diffusers environments. zerostart caches extracted wheels and hardlinks them into new environments — so the second torch-based environment skips re-extracting those 6GB.
 
 ## Install
 
@@ -203,7 +214,7 @@ Auto-registers via vLLM's plugin system when zerostart is installed.
 
 ## Architecture
 
-The entire cold path runs in Rust — no Python orchestrator:
+The entire cold path runs in Rust with progressive loading:
 
 ```
 zerostart run -p torch serve.py
@@ -211,38 +222,42 @@ zerostart run -p torch serve.py
   1. Find Python          (uv python find || which python3)
   2. Check warm cache     (stat .complete marker — instant)
   3. Resolve deps         (uv pip compile --format pylock.toml)
-  4. Check shared cache   (hardlink cached CUDA libs)
-  5. Stream wheels        (parallel Range-request download + extract)
-  6. exec(python)         (replaces process, no overhead)
+  4. Detect system CUDA   (skip nvidia wheels if system libs match)
+  5. Check shared cache   (hardlink cached CUDA libs)
+  6. Start daemon         (GET+pipeline download + parallel extract)
+  7. Start Python         (immediately, with lazy import hook)
+     └─ imports block only until their package is extracted
 ```
 
 Key design decisions:
 
-- **All wheels through the streaming daemon** — every package with a wheel URL goes through parallel download+extract. Only sdist-only packages (rare) fall back to `uv pip install`.
+- **Progressive loading** — Python starts immediately. Imports block per-package, not globally. Health checks respond in seconds, not minutes.
+- **GET+pipeline** — single GET per wheel (maximizes bandwidth), 4 parallel extract workers (prevents small wheels queuing behind large ones).
+- **System CUDA detection** — skips nvidia-* wheels when the pod already has compatible CUDA libraries, saving ~2-6GB of downloads.
 - **Atomic extraction** — each wheel extracts to a staging directory, then renames into site-packages. Partial extractions never corrupt the target.
 - **No venv overhead** — uses a flat site-packages directory with a content-addressed cache key.
-- **Demand-driven scheduling** — when Python hits `import torch`, the daemon reprioritizes torch to the front of the download queue.
 
 ## Tuning
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ZS_PARALLEL_DOWNLOADS` | 16 | Concurrent HTTP connections |
+| `ZS_PARALLEL_DOWNLOADS` | 32 | Concurrent HTTP connections |
 | `ZS_EXTRACT_THREADS` | num_cpus * 2 | Parallel extraction threads |
-| `ZS_CHUNK_MB` | 16 | Streaming chunk size (MB) for Range requests |
 | `ZEROSTART_CACHE` | `~/.cache/zerostart` | Cache directory |
+| `ZS_NO_SYSTEM_CUDA` | unset | Disable system CUDA detection |
+| `ZS_NO_SHARED_CACHE` | unset | Disable shared wheel cache |
 
 ## When to Use It
 
 **Good fit:**
+- Inference servers — health check in <2s on cold start vs 45s+ with uv
 - Repeated runs on the same pod — warm starts are 4-7x faster than uv
-- Large GPU packages on bandwidth-constrained pods — parallel downloads help when a single connection is slow
-- Spot instances, CI/CD, autoscaling where you restart often and warm cache pays off
+- Spot instances, CI/CD, autoscaling where you restart often
+- Large GPU packages (torch, vllm, diffusers) — parallel downloads + progressive loading
 
 **Not worth it:**
-- One-off cold starts on fast-network pods — uv is just as fast
-- Small packages — uv is faster, zerostart adds startup overhead
-- Local NVMe with models in page cache
+- Small packages only — uv is faster, zerostart adds startup overhead
+- One-off scripts that don't need to respond to health checks during install
 
 ## Requirements
 
@@ -250,7 +265,7 @@ Key design decisions:
 - `uv` for dependency resolution (pre-installed on most GPU containers)
 - Python 3.10+
 
-macOS works for development (same CLI, no streaming optimization).
+macOS works for development (same CLI, no GPU optimization).
 
 ## gpu-cli Integration
 
