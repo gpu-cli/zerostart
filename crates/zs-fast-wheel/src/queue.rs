@@ -4,7 +4,8 @@ use crate::manifest::WheelSpec;
 
 /// Priority queue for wheel installation scheduling.
 ///
-/// Default order: small wheels first, large last.
+/// Default order: large wheels first (start downloading big wheels early so
+/// extraction can pipeline with remaining downloads).
 /// Supports demand-driven reprioritization via `prioritize()`.
 pub struct InstallQueue {
     /// Wheels not yet started, ordered by priority
@@ -17,9 +18,10 @@ pub struct InstallQueue {
 
 impl InstallQueue {
     /// Create a new queue from a list of wheel specs.
-    /// Sorts by size ascending (small wheels first).
+    /// Sorts by size descending (large wheels first — download big wheels early
+    /// so extraction starts sooner and pipelines better with remaining downloads).
     pub fn new(mut wheels: Vec<WheelSpec>) -> Self {
-        wheels.sort_by_key(|w| w.size);
+        wheels.sort_by_key(|w| std::cmp::Reverse(w.size));
         Self {
             pending: wheels.into(),
             in_progress: HashSet::new(),
@@ -99,7 +101,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sorts_by_size_ascending() {
+    fn test_sorts_by_size_descending() {
         let wheels = vec![
             make_wheel("torch", 900_000_000),
             make_wheel("six", 12_000),
@@ -108,11 +110,11 @@ mod tests {
         let mut queue = InstallQueue::new(wheels);
 
         let first = queue.next().unwrap();
-        assert_eq!(first.distribution, "six");
+        assert_eq!(first.distribution, "torch");
         let second = queue.next().unwrap();
         assert_eq!(second.distribution, "numpy");
         let third = queue.next().unwrap();
-        assert_eq!(third.distribution, "torch");
+        assert_eq!(third.distribution, "six");
         assert!(queue.next().is_none());
     }
 
@@ -125,9 +127,10 @@ mod tests {
         ];
         let mut queue = InstallQueue::new(wheels);
 
-        queue.prioritize("torch");
+        // six is last (smallest) — prioritize moves it to front
+        queue.prioritize("six");
         let first = queue.next().unwrap();
-        assert_eq!(first.distribution, "torch");
+        assert_eq!(first.distribution, "six");
     }
 
     #[test]
@@ -139,13 +142,13 @@ mod tests {
         let mut queue = InstallQueue::new(wheels);
 
         let first = queue.next().unwrap();
-        assert_eq!(first.distribution, "six");
-        queue.mark_done("six");
+        assert_eq!(first.distribution, "torch"); // largest first
+        queue.mark_done("torch");
 
         // Prioritizing a done package should be a no-op
-        queue.prioritize("six");
+        queue.prioritize("torch");
         let second = queue.next().unwrap();
-        assert_eq!(second.distribution, "torch");
+        assert_eq!(second.distribution, "six");
     }
 
     #[test]
@@ -157,13 +160,13 @@ mod tests {
         ];
         let mut queue = InstallQueue::new(wheels);
 
-        let first = queue.next().unwrap(); // six is now in_progress
-        assert_eq!(first.distribution, "six");
+        let first = queue.next().unwrap(); // torch is now in_progress (largest first)
+        assert_eq!(first.distribution, "torch");
 
         // Prioritizing an in-progress package should be a no-op
-        queue.prioritize("six");
+        queue.prioritize("torch");
         let second = queue.next().unwrap();
-        assert_eq!(second.distribution, "numpy"); // not six again
+        assert_eq!(second.distribution, "numpy"); // not torch again
     }
 
     #[test]

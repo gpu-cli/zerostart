@@ -29,6 +29,18 @@ pub struct DaemonConfig {
     pub extract_threads: usize,
 }
 
+impl DaemonConfig {
+    /// Number of parallel extract workers. Each worker pulls wheels from the
+    /// channel and extracts independently, preventing small wheels from queuing
+    /// behind large ones. Each worker gets `extract_threads / workers` rayon threads.
+    pub fn extract_workers(&self) -> usize {
+        // 4 workers is a good default: allows 4 wheels to extract simultaneously,
+        // each with ~6-7 threads on a 26-core machine.
+        // Minimum 1, cap at extract_threads (no point having more workers than threads).
+        4.min(self.extract_threads)
+    }
+}
+
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
@@ -121,10 +133,11 @@ impl DaemonEngine {
             .pool_max_idle_per_host(config.parallel_downloads)
             .build()?;
 
-        // Channel: downloaded wheels flow from download workers → extract worker.
-        // Small capacity (4) provides backpressure — if extraction is slow,
-        // downloads pause rather than filling disk with temp files.
-        let (tx, rx) = tokio::sync::mpsc::channel::<DownloadedWheel>(4);
+        // Channel: downloaded wheels flow from download workers → extract workers.
+        // Capacity = 2 * extract_workers provides enough buffering for workers to
+        // stay busy while providing backpressure to avoid filling disk with temp files.
+        let num_workers = config.extract_workers();
+        let (tx, rx) = tokio::sync::mpsc::channel::<DownloadedWheel>(num_workers * 2);
 
         let tmp_dir = tempfile::tempdir().context("failed to create temp dir")?;
         let tmp_path = tmp_dir.path().to_path_buf();
@@ -191,76 +204,95 @@ impl DaemonEngine {
         drop(tx);
 
         // === Extract stage ===
-        // Single blocking loop: receives downloaded wheels, extracts each immediately.
-        // Extraction uses all extract_threads for parallelism within a single wheel.
-        let site_packages = config.site_packages.clone();
-        let ext_threads = config.extract_threads;
-        let stats = self.stats.clone();
-        let completion = self.completion.clone();
-        let queue = self.queue.clone();
-        let total_wheels = self.total_wheels;
+        // Multiple extract workers pull from the same channel, extracting different
+        // wheels in parallel. Each worker gets a share of the total extract threads.
+        // This prevents small wheels from queuing behind large ones.
+        let num_extract_workers = config.extract_workers();
+        let threads_per_worker = (config.extract_threads / num_extract_workers).max(1);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
 
-        let extract_handle = tokio::task::spawn_blocking(move || {
-            let rx = rx;
-            // blocking_recv in a loop — channel closes when all downloads finish
-            let mut rx = rx;
-            while let Some(downloaded) = rx.blocking_recv() {
-                let dist = downloaded.spec.distribution.clone();
-                let extract_start = Instant::now();
+        let mut extract_handles = Vec::new();
+        for worker_id in 0..num_extract_workers {
+            let site_packages = config.site_packages.clone();
+            let stats = self.stats.clone();
+            let completion = self.completion.clone();
+            let queue = self.queue.clone();
+            let total_wheels = self.total_wheels;
+            let rx = rx.clone();
 
-                let result = extract::extract_wheel_atomic(
-                    &downloaded.path,
-                    &site_packages,
-                    &dist,
-                    ext_threads,
-                    true,
-                    &stats,
-                );
+            let handle = tokio::task::spawn_blocking(move || {
+                loop {
+                    // Lock channel briefly to receive next wheel
+                    let downloaded = {
+                        let mut rx = rx.blocking_lock();
+                        rx.blocking_recv()
+                    };
+                    let downloaded = match downloaded {
+                        Some(d) => d,
+                        None => break, // channel closed
+                    };
 
-                let (lock, cvar) = &*completion;
+                    let dist = downloaded.spec.distribution.clone();
+                    let extract_start = Instant::now();
 
-                match result {
-                    Ok(()) => {
-                        let elapsed = extract_start.elapsed();
-                        tracing::info!(
-                            "[{dist}] extracted in {:.1}s",
-                            elapsed.as_secs_f64()
-                        );
+                    tracing::debug!("[{dist}] extract worker {worker_id} starting");
 
-                        {
-                            let mut q = queue.lock().unwrap();
-                            q.mark_done(&dist);
+                    let result = extract::extract_wheel_atomic(
+                        &downloaded.path,
+                        &site_packages,
+                        &dist,
+                        threads_per_worker,
+                        true,
+                        &stats,
+                    );
+
+                    let (lock, cvar) = &*completion;
+
+                    match result {
+                        Ok(()) => {
+                            let elapsed = extract_start.elapsed();
+                            tracing::info!(
+                                "[{dist}] extracted in {:.1}s (worker {worker_id})",
+                                elapsed.as_secs_f64()
+                            );
+
+                            {
+                                let mut q = queue.lock().unwrap();
+                                q.mark_done(&dist);
+                            }
+
+                            let mut state = lock.lock().unwrap();
+                            state.done.insert(dist);
+                            if state.done.len() + state.failed.len() >= total_wheels {
+                                state.all_finished = true;
+                            }
+                            cvar.notify_all();
                         }
+                        Err(e) => {
+                            let err_msg = format!("{e:#}");
+                            tracing::error!("[{dist}] extraction failed: {err_msg}");
 
-                        let mut state = lock.lock().unwrap();
-                        state.done.insert(dist);
-                        if state.done.len() + state.failed.len() >= total_wheels {
-                            state.all_finished = true;
+                            {
+                                let mut q = queue.lock().unwrap();
+                                q.mark_failed(&dist);
+                            }
+
+                            let mut state = lock.lock().unwrap();
+                            state.failed.insert(dist, err_msg);
+                            if state.done.len() + state.failed.len() >= total_wheels {
+                                state.all_finished = true;
+                            }
+                            cvar.notify_all();
                         }
-                        cvar.notify_all();
                     }
-                    Err(e) => {
-                        let err_msg = format!("{e:#}");
-                        tracing::error!("[{dist}] extraction failed: {err_msg}");
 
-                        {
-                            let mut q = queue.lock().unwrap();
-                            q.mark_failed(&dist);
-                        }
-
-                        let mut state = lock.lock().unwrap();
-                        state.failed.insert(dist, err_msg);
-                        if state.done.len() + state.failed.len() >= total_wheels {
-                            state.all_finished = true;
-                        }
-                        cvar.notify_all();
-                    }
+                    // Clean up temp file
+                    let _ = std::fs::remove_file(&downloaded.path);
                 }
+            });
 
-                // Clean up temp file
-                let _ = std::fs::remove_file(&downloaded.path);
-            }
-        });
+            extract_handles.push(handle);
+        }
 
         // === Wait for download failures ===
         // Collect download errors and mark them as failed
@@ -277,8 +309,10 @@ impl DaemonEngine {
             }
         }
 
-        // Wait for extract worker to finish
-        extract_handle.await?;
+        // Wait for all extract workers to finish
+        for handle in extract_handles {
+            handle.await?;
+        }
 
         // Mark all finished
         {
