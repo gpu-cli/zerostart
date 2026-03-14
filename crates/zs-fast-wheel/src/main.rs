@@ -253,6 +253,16 @@ fn exec_python(
     target: &str,
     target_args: &[String],
 ) -> ! {
+    exec_python_with_cuda(python, site_packages, target, target_args, &[])
+}
+
+fn exec_python_with_cuda(
+    python: &std::path::Path,
+    site_packages: &std::path::Path,
+    target: &str,
+    target_args: &[String],
+    cuda_dirs: &[PathBuf],
+) -> ! {
     let mut pythonpath = site_packages.to_string_lossy().to_string();
     if let Ok(existing) = std::env::var("PYTHONPATH") {
         pythonpath = format!("{pythonpath}:{existing}");
@@ -367,11 +377,16 @@ else:
         args_repr = args_str,
     );
 
-    let err = std::process::Command::new(python)
-        .env("PYTHONPATH", &pythonpath)
+    let mut cmd = std::process::Command::new(python);
+    cmd.env("PYTHONPATH", &pythonpath)
         .arg("-c")
-        .arg(&script)
-        .exec();
+        .arg(&script);
+
+    if !cuda_dirs.is_empty() {
+        cmd.env("LD_LIBRARY_PATH", cuda_ld_library_path(cuda_dirs));
+    }
+
+    let err = cmd.exec();
 
     eprintln!("exec failed: {err}");
     std::process::exit(1);
@@ -385,6 +400,7 @@ fn spawn_python_with_cache(
     target: &str,
     target_args: &[String],
     _cache_handle: Option<tokio::task::JoinHandle<()>>,
+    cuda_dirs: &[PathBuf],
 ) -> ! {
     let mut pythonpath = site_packages.to_string_lossy().to_string();
     if let Ok(existing) = std::env::var("PYTHONPATH") {
@@ -492,12 +508,14 @@ else:
     );
 
     // Spawn Python as child (not exec) so we can continue cache work
-    let mut child = match std::process::Command::new(python)
-        .env("PYTHONPATH", &pythonpath)
+    let mut cmd = std::process::Command::new(python);
+    cmd.env("PYTHONPATH", &pythonpath)
         .arg("-c")
-        .arg(&script)
-        .spawn()
-    {
+        .arg(&script);
+    if !cuda_dirs.is_empty() {
+        cmd.env("LD_LIBRARY_PATH", cuda_ld_library_path(cuda_dirs));
+    }
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Failed to spawn Python: {e}");
@@ -566,6 +584,246 @@ fn uv_install(venv: &std::path::Path, specs: &[String]) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Detect system CUDA installation.
+///
+/// Returns (lib_dirs, cuda_version) if system CUDA is found and version is sufficient.
+/// Only returns lib dirs if the system CUDA version >= the required version (12.8 for
+/// torch 2.10's cu128 wheels). This prevents ABI mismatches where system CUDA 12.4
+/// libraries lack symbols required by torch compiled against CUDA 12.8.
+fn detect_system_cuda() -> (Vec<PathBuf>, Option<(u32, u32)>) {
+    // Disable with env var
+    if std::env::var("ZS_NO_SYSTEM_CUDA").is_ok() {
+        return (Vec::new(), None);
+    }
+
+    let mut lib_dirs = Vec::new();
+
+    // Detect CUDA version
+    let version = detect_cuda_version();
+
+    // Check CUDA_HOME / CUDA_PATH first (most reliable)
+    for var in &["CUDA_HOME", "CUDA_PATH"] {
+        if let Ok(cuda_home) = std::env::var(var) {
+            for subdir in &["lib64", "lib"] {
+                let path = PathBuf::from(&cuda_home).join(subdir);
+                if has_lib(&path, "libcudart") && !lib_dirs.contains(&path) {
+                    lib_dirs.push(path);
+                }
+            }
+        }
+    }
+
+    // Check standard locations
+    for dir in &[
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda/lib",
+        "/usr/lib/x86_64-linux-gnu",
+    ] {
+        let path = PathBuf::from(dir);
+        if has_lib(&path, "libcudart") && !lib_dirs.contains(&path) {
+            lib_dirs.push(path);
+        }
+    }
+
+    // Also check for cuDNN (separate from CUDA toolkit)
+    for dir in &[
+        "/usr/local/cuda/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/local/lib",
+    ] {
+        let path = PathBuf::from(dir);
+        if has_lib(&path, "libcudnn") && !lib_dirs.contains(&path) {
+            lib_dirs.push(path);
+        }
+    }
+
+    (lib_dirs, version)
+}
+
+/// Detect the system CUDA toolkit version.
+///
+/// Tries (in order):
+/// 1. /usr/local/cuda/version.json (newer CUDA installs)
+/// 2. /usr/local/cuda/version.txt (older CUDA installs)
+/// 3. nvcc --version
+fn detect_cuda_version() -> Option<(u32, u32)> {
+    // Try version.json first (CUDA 12.0+)
+    if let Ok(content) = std::fs::read_to_string("/usr/local/cuda/version.json") {
+        // Parse: {"cuda": {"name": "CUDA SDK", "version": "12.4.1"}}
+        if let Some(ver) = parse_version_from_json(&content) {
+            return Some(ver);
+        }
+    }
+
+    // Try version.txt
+    if let Ok(content) = std::fs::read_to_string("/usr/local/cuda/version.txt") {
+        // Format: "CUDA Version 12.4.1"
+        if let Some(ver) = parse_version_from_text(&content) {
+            return Some(ver);
+        }
+    }
+
+    // Try nvcc --version
+    if let Ok(output) = std::process::Command::new("nvcc").arg("--version").output() {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // "Cuda compilation tools, release 12.4, V12.4.131"
+            if let Some(ver) = parse_version_from_text(&stdout) {
+                return Some(ver);
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse CUDA version (major, minor) from version.json content.
+fn parse_version_from_json(content: &str) -> Option<(u32, u32)> {
+    // Simple parsing — look for "version": "12.4.1"
+    let version_key = "\"version\"";
+    let idx = content.find(version_key)?;
+    let rest = &content[idx + version_key.len()..];
+    // Skip to the value
+    let quote_start = rest.find('"')? + 1;
+    let rest = &rest[quote_start..];
+    let quote_end = rest.find('"')?;
+    let version_str = &rest[..quote_end];
+    parse_version_string(version_str)
+}
+
+/// Parse CUDA version (major, minor) from text containing "X.Y" or "X.Y.Z".
+fn parse_version_from_text(content: &str) -> Option<(u32, u32)> {
+    // Look for a pattern like "12.4" or "12.4.1"
+    for word in content.split(|c: char| !c.is_ascii_digit() && c != '.') {
+        if let Some(ver) = parse_version_string(word) {
+            if ver.0 >= 10 {
+                // CUDA versions are 10+
+                return Some(ver);
+            }
+        }
+    }
+    None
+}
+
+/// Parse "X.Y" or "X.Y.Z" into (major, minor).
+fn parse_version_string(s: &str) -> Option<(u32, u32)> {
+    let mut parts = s.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Check if a directory contains a library with the given prefix.
+fn has_lib(dir: &Path, prefix: &str) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(prefix) && name.contains(".so") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Map nvidia wheel distribution names to the .so library they provide.
+/// Only skip a wheel if the system actually has the corresponding library.
+/// Some libraries (cusparselt, nvshmem) are NOT part of the standard CUDA toolkit.
+fn nvidia_wheel_system_lib(distribution: &str) -> Option<&'static str> {
+    match distribution {
+        d if d.starts_with("nvidia-cublas-cu") => Some("libcublas"),
+        d if d.starts_with("nvidia-cuda-cupti-cu") => Some("libcupti"),
+        d if d.starts_with("nvidia-cuda-nvrtc-cu") => Some("libnvrtc"),
+        d if d.starts_with("nvidia-cuda-runtime-cu") => Some("libcudart"),
+        d if d.starts_with("nvidia-cudnn-cu") => Some("libcudnn"),
+        d if d.starts_with("nvidia-cufft-cu") => Some("libcufft"),
+        d if d.starts_with("nvidia-cufile-cu") => Some("libcufile"),
+        d if d.starts_with("nvidia-curand-cu") => Some("libcurand"),
+        d if d.starts_with("nvidia-cusolver-cu") => Some("libcusolver"),
+        d if d.starts_with("nvidia-cusparse-cu") && !d.contains("cusparselt") => {
+            Some("libcusparse")
+        }
+        d if d.starts_with("nvidia-cusparselt-cu") => Some("libcusparseLt"),
+        d if d.starts_with("nvidia-nccl-cu") => Some("libnccl"),
+        d if d.starts_with("nvidia-nvjitlink-cu") => Some("libnvjitlink"),
+        d if d.starts_with("nvidia-nvshmem-cu") => Some("libnvshmem"),
+        d if d.starts_with("nvidia-nvtx-cu") => Some("libnvToolsExt"),
+        _ => None,
+    }
+}
+
+/// Check if a specific library exists in any of the CUDA directories.
+fn system_has_lib(cuda_dirs: &[PathBuf], lib_prefix: &str) -> bool {
+    cuda_dirs.iter().any(|dir| has_lib(dir, lib_prefix))
+}
+
+/// Extract the CUDA minor version required by an nvidia wheel from its version.
+///
+/// nvidia-cublas-cu12 version "12.8.3.14" → needs CUDA 12.8
+/// nvidia-cudnn-cu12 version "9.8.0.87" → cuDNN (separate versioning, always needs matching CUDA)
+fn required_cuda_minor(spec: &WheelSpec) -> u32 {
+    // For nvidia-cuda-* and nvidia-cu* packages, the version starts with "12.X"
+    // where X is the CUDA minor version
+    if let Some((major, minor)) = parse_version_string(&spec.version) {
+        if major == 12 {
+            return minor;
+        }
+    }
+    // For cuDNN, NCCL, etc. with their own versioning, we can't tell from the
+    // version string. Fall back to requiring the latest known CUDA minor.
+    // torch 2.10 uses cu128, so require 12.8.
+    8
+}
+
+/// Build LD_LIBRARY_PATH with system CUDA dirs prepended.
+fn cuda_ld_library_path(cuda_dirs: &[PathBuf]) -> String {
+    let mut parts: Vec<String> = cuda_dirs
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    if let Ok(existing) = std::env::var("LD_LIBRARY_PATH") {
+        parts.push(existing);
+    }
+    parts.join(":")
+}
+
+/// Write stub .dist-info for a skipped nvidia wheel so importlib.metadata
+/// can find it (prevents "package not found" from dependency checkers).
+fn write_stub_dist_info(
+    site_packages: &Path,
+    distribution: &str,
+    version: &str,
+) {
+    let dist_dir = site_packages.join(format!(
+        "{}-{}.dist-info",
+        distribution.replace('-', "_"),
+        version
+    ));
+    if dist_dir.exists() {
+        return;
+    }
+    if std::fs::create_dir_all(&dist_dir).is_err() {
+        return;
+    }
+
+    // Minimal METADATA
+    let metadata = format!(
+        "Metadata-Version: 2.1\nName: {distribution}\nVersion: {version}\n"
+    );
+    let _ = std::fs::write(dist_dir.join("METADATA"), metadata);
+
+    // INSTALLER
+    let _ = std::fs::write(dist_dir.join("INSTALLER"), "zerostart\n");
+
+    // RECORD (empty)
+    let _ = std::fs::write(dist_dir.join("RECORD"), "");
 }
 
 /// Parse a requirements file into a list of package specifiers.
@@ -987,7 +1245,9 @@ async fn main() -> Result<()> {
                     if verbose {
                         eprintln!("Cache hit — skipping resolution");
                     }
-                    exec_python(&python, &sp, &target, &target_args);
+                    // Detect system CUDA for LD_LIBRARY_PATH
+                    let (cuda_dirs, _) = detect_system_cuda();
+                    exec_python_with_cuda(&python, &sp, &target, &target_args, &cuda_dirs);
                 }
             }
 
@@ -1015,12 +1275,77 @@ async fn main() -> Result<()> {
                 exec_python(&python, &site_packages, &target, &target_args);
             }
 
+            // Detect system CUDA — skip nvidia-* wheels when system provides compatible libs
+            let (cuda_dirs, cuda_version) = detect_system_cuda();
+            let daemon_wheels = if cuda_dirs.is_empty() {
+                plan.daemon_wheels.clone()
+            } else {
+                let sys_major = cuda_version.map(|v| v.0).unwrap_or(0);
+                let sys_minor = cuda_version.map(|v| v.1).unwrap_or(0);
+
+                if verbose {
+                    if let Some((maj, min)) = cuda_version {
+                        eprintln!("System CUDA {maj}.{min} detected");
+                    } else {
+                        eprintln!("System CUDA detected (version unknown — skipping nvidia wheel optimization)");
+                    }
+                }
+
+                // Only proceed with skipping if we know the system CUDA version
+                if cuda_version.is_none() {
+                    plan.daemon_wheels.clone()
+                } else {
+                    let mut keep = Vec::new();
+                    let mut skipped = Vec::new();
+                    for spec in &plan.daemon_wheels {
+                        if let Some(lib_prefix) = nvidia_wheel_system_lib(&spec.distribution) {
+                            let needed_minor = required_cuda_minor(spec);
+                            if sys_major >= 12
+                                && sys_minor >= needed_minor
+                                && system_has_lib(&cuda_dirs, lib_prefix)
+                            {
+                                skipped.push(spec.clone());
+                                continue;
+                            }
+                            if verbose {
+                                if sys_minor < needed_minor {
+                                    eprintln!(
+                                        "  {} — needs CUDA 12.{needed_minor}, system has 12.{sys_minor}",
+                                        spec.distribution
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "  {} — {lib_prefix}.so not found on system",
+                                        spec.distribution
+                                    );
+                                }
+                            }
+                        }
+                        keep.push(spec.clone());
+                    }
+                    if !skipped.is_empty() {
+                        let skipped_mb: f64 =
+                            skipped.iter().map(|s| s.size as f64).sum::<f64>() / 1024.0 / 1024.0;
+                        eprintln!(
+                            "System CUDA {sys_major}.{sys_minor} — skipping {} nvidia wheels ({:.0} MB)",
+                            skipped.len(),
+                            skipped_mb
+                        );
+                        // Write stub .dist-info so importlib.metadata finds them
+                        for spec in &skipped {
+                            write_stub_dist_info(&site_packages, &spec.distribution, &spec.version);
+                        }
+                    }
+                    keep
+                }
+            };
+
             if verbose {
                 eprintln!(
                     "Resolved: {} packages ({} sdist via uv, {} wheels via daemon)",
                     plan.all.len(),
                     plan.uv_specs.len(),
-                    plan.daemon_wheels.len(),
+                    daemon_wheels.len(),
                 );
             }
 
@@ -1046,15 +1371,15 @@ async fn main() -> Result<()> {
                 None
             };
 
-            if !plan.daemon_wheels.is_empty() {
+            if !daemon_wheels.is_empty() {
                 let no_shared_cache = std::env::var("ZS_NO_SHARED_CACHE").is_ok();
 
                 // Check shared cache in parallel — restore cached wheels via hardlinks
                 let (uncached_wheels, cached_count) = if no_shared_cache {
-                    (plan.daemon_wheels.clone(), 0u32)
+                    (daemon_wheels.clone(), 0u32)
                 } else {
                     let sp_for_cache = site_packages.clone();
-                    let wheels_for_cache = plan.daemon_wheels.clone();
+                    let wheels_for_cache = daemon_wheels.clone();
                     let cache_results: Vec<bool> = tokio::task::spawn_blocking(move || {
                         use rayon::prelude::*;
                         wheels_for_cache
@@ -1067,7 +1392,7 @@ async fn main() -> Result<()> {
                     let mut uncached = Vec::new();
                     let mut count = 0u32;
 
-                    for (spec, was_cached) in plan.daemon_wheels.iter().zip(cache_results.iter()) {
+                    for (spec, was_cached) in daemon_wheels.iter().zip(cache_results.iter()) {
                         if *was_cached {
                             count += 1;
                             if verbose {
@@ -1162,9 +1487,9 @@ async fn main() -> Result<()> {
             // so cache population can continue while the script runs.
             // Otherwise, exec directly (more efficient, preserves signals).
             if needs_cache_populate {
-                spawn_python_with_cache(&python, &site_packages, &target, &target_args, cache_handle);
+                spawn_python_with_cache(&python, &site_packages, &target, &target_args, cache_handle, &cuda_dirs);
             } else {
-                exec_python(&python, &site_packages, &target, &target_args);
+                exec_python_with_cuda(&python, &site_packages, &target, &target_args, &cuda_dirs);
             }
         }
 
