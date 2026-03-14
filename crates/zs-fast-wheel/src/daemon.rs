@@ -27,6 +27,10 @@ pub struct DaemonConfig {
     pub site_packages: PathBuf,
     pub parallel_downloads: usize,
     pub extract_threads: usize,
+    /// Directory where per-package ready markers are written.
+    /// Enables progressive loading: Python starts immediately and imports
+    /// block only until their specific package's marker appears.
+    pub ready_dir: Option<PathBuf>,
 }
 
 impl DaemonConfig {
@@ -49,6 +53,7 @@ impl Default for DaemonConfig {
             extract_threads: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4),
+            ready_dir: None,
         }
     }
 }
@@ -219,6 +224,7 @@ impl DaemonEngine {
             let queue = self.queue.clone();
             let total_wheels = self.total_wheels;
             let rx = rx.clone();
+            let ready_dir = config.ready_dir.clone();
 
             let handle = tokio::task::spawn_blocking(move || {
                 loop {
@@ -255,6 +261,11 @@ impl DaemonEngine {
                                 "[{dist}] extracted in {:.1}s (worker {worker_id})",
                                 elapsed.as_secs_f64()
                             );
+
+                            // Write ready marker for progressive loading
+                            if let Some(ref rd) = ready_dir {
+                                let _ = std::fs::File::create(rd.join(&dist));
+                            }
 
                             {
                                 let mut q = queue.lock().unwrap();
@@ -320,6 +331,11 @@ impl DaemonEngine {
             let mut state = lock.lock().unwrap();
             state.all_finished = true;
             cvar.notify_all();
+        }
+
+        // Write all_done marker for progressive loading
+        if let Some(ref ready_dir) = config.ready_dir {
+            let _ = std::fs::File::create(ready_dir.join(".all_done"));
         }
 
         let elapsed = start.elapsed();

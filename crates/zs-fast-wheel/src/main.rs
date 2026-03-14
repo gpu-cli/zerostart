@@ -392,16 +392,20 @@ else:
     std::process::exit(1);
 }
 
-/// Spawn Python as a child process, run cache population in background, wait for child.
-/// Used when we need to populate the shared cache concurrently with script execution.
-fn spawn_python_with_cache(
+/// Spawn Python with progressive loading: imports block until their package is extracted.
+///
+/// The daemon runs in the background writing ready markers to `ready_dir`.
+/// Python starts immediately with an inline lazy import hook that polls for markers.
+/// Imports block only until their specific package's marker appears.
+fn spawn_python_progressive(
     python: &std::path::Path,
     site_packages: &std::path::Path,
     target: &str,
     target_args: &[String],
-    _cache_handle: Option<tokio::task::JoinHandle<()>>,
+    ready_dir: &std::path::Path,
+    import_map: &std::collections::HashMap<String, String>,
     cuda_dirs: &[PathBuf],
-) -> ! {
+) -> std::process::Child {
     let mut pythonpath = site_packages.to_string_lossy().to_string();
     if let Ok(existing) = std::env::var("PYTHONPATH") {
         pythonpath = format!("{pythonpath}:{existing}");
@@ -409,18 +413,88 @@ fn spawn_python_with_cache(
 
     let sp_str = site_packages.display().to_string();
     let args_str = format!("{target_args:?}");
+    let ready_dir_str = ready_dir.display().to_string();
 
-    // Same entry-point-discovery script as exec_python
+    // Serialize import_map as Python dict literal
+    let mut map_parts = Vec::new();
+    for (k, v) in import_map {
+        map_parts.push(format!("'{}':'{}'", k.replace('\'', "\\'"), v.replace('\'', "\\'")));
+    }
+    let import_map_py = format!("{{{}}}", map_parts.join(","));
+
+    // Python bootstrap: lazy import hook + entry point discovery
     let script = format!(
         r#"
-import sys, os, re, importlib, subprocess
+import sys, os, time, importlib, importlib.abc, importlib.util, re, subprocess
 from pathlib import Path
 from configparser import ConfigParser
 
+# --- Progressive loading hook ---
+class _ZSHook(importlib.abc.MetaPathFinder):
+    def __init__(self, ready_dir, import_map):
+        self._ready_dir = ready_dir
+        self._import_map = import_map
+        self._resolved = set()
+        self._wait_times = {{}}
+
+    def _can_import(self, name):
+        idx = sys.meta_path.index(self)
+        sys.meta_path.pop(idx)
+        try:
+            return importlib.util.find_spec(name) is not None
+        except (ModuleNotFoundError, ValueError, ImportError):
+            return False
+        finally:
+            sys.meta_path.insert(idx, self)
+
+    def find_spec(self, fullname, path=None, target=None):
+        top = fullname.split('.')[0]
+        if top in self._resolved:
+            return None
+        if self._can_import(fullname):
+            self._resolved.add(top)
+            return None
+
+        dist = self._import_map.get(top, top)
+        all_done = os.path.join(self._ready_dir, '.all_done')
+        marker = os.path.join(self._ready_dir, dist)
+
+        # Unknown package not in our map — don't wait
+        if dist == top and top not in self._import_map and self._import_map:
+            norm = top.lower().replace('-', '_')
+            known = any(v.lower().replace('-', '_') == norm for v in self._import_map.values())
+            if not known:
+                self._resolved.add(top)
+                return None
+
+        t0 = time.monotonic()
+        wait = 0.01
+        while time.monotonic() - t0 < 300:
+            if os.path.exists(marker) or os.path.exists(all_done):
+                importlib.invalidate_caches()
+                sys.path_importer_cache.clear()
+                elapsed = time.monotonic() - t0
+                if elapsed > 0.1:
+                    self._wait_times[top] = elapsed
+                    print(f'  [zerostart] {{top}}: ready ({{elapsed:.1f}}s)', file=sys.stderr, flush=True)
+                self._resolved.add(top)
+                return None
+            time.sleep(wait)
+            wait = min(wait * 1.5, 0.2)
+
+        self._resolved.add(top)
+        return None
+
+_zs_hook = _ZSHook({ready_dir_repr}, {import_map_repr})
+sys.meta_path.insert(0, _zs_hook)
+
+# --- Entry point discovery + execution ---
 sp = {sp_repr}
 target = {target_repr}
 args = {args_repr}
 sys.path.insert(0, sp)
+# Remove system dist-packages to prevent conflicts
+sys.path[:] = [p for p in sys.path if p == sp or 'dist-packages' not in p]
 
 if target.endswith('.py') or Path(target).is_file():
     sys.argv = [target] + args
@@ -501,40 +575,35 @@ else:
                 pass
             print(f"Error: no entry point found for '{{target}}'", file=sys.stderr)
             sys.exit(1)
+
+# Print wait report
+if _zs_hook._wait_times:
+    total = sum(_zs_hook._wait_times.values())
+    print(f'  [zerostart] total import wait: {{total:.1f}}s', file=sys.stderr, flush=True)
 "#,
+        ready_dir_repr = format!("'{}'", ready_dir_str.replace('\'', "\\'")),
+        import_map_repr = import_map_py,
         sp_repr = format!("'{}'", sp_str.replace('\'', "\\'")),
         target_repr = format!("'{}'", target.replace('\'', "\\'")),
         args_repr = args_str,
     );
 
-    // Spawn Python as child (not exec) so we can continue cache work
     let mut cmd = std::process::Command::new(python);
     cmd.env("PYTHONPATH", &pythonpath)
         .arg("-c")
         .arg(&script);
+
     if !cuda_dirs.is_empty() {
         cmd.env("LD_LIBRARY_PATH", cuda_ld_library_path(cuda_dirs));
     }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
+
+    match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             eprintln!("Failed to spawn Python: {e}");
             std::process::exit(1);
         }
-    };
-
-    // Wait for child and cache handle concurrently
-    // The cache_handle is on the tokio runtime which is still alive
-    let status = child.wait().unwrap_or_else(|e| {
-        eprintln!("Failed to wait for Python: {e}");
-        std::process::exit(1);
-    });
-
-    // Don't wait for cache population — it's best-effort for future cold starts.
-    // The script has already finished; exit with its status code.
-    // Note: std::process::exit() will kill the cache thread, but that's OK —
-    // partial cache is still useful and next cold start fills the rest.
-    std::process::exit(status.code().unwrap_or(1));
+    }
 }
 
 /// Create a venv using uv if it doesn't exist.
@@ -1252,9 +1321,6 @@ async fn main() -> Result<()> {
             }
 
             // === COLD PATH — all in Rust ===
-            let mut needs_cache_populate = false;
-            let mut cache_handle: Option<tokio::task::JoinHandle<()>> = None;
-
             if verbose {
                 eprintln!("Cache miss — resolving...");
             }
@@ -1426,15 +1492,73 @@ async fn main() -> Result<()> {
                     if verbose {
                         eprintln!("Config: parallel_downloads={pd}, extract_threads={et}");
                     }
+
+                    // === Progressive loading ===
+                    // Start daemon in background, start Python immediately.
+                    // Python imports block only until their specific package is extracted.
+                    let ready_dir = tempfile::tempdir()
+                        .context("failed to create ready dir")?
+                        .keep();
+
+                    // Build import map: import_name → distribution_name
+                    let mut import_map = std::collections::HashMap::new();
+                    for spec in &uncached_wheels {
+                        for root in &spec.import_roots {
+                            import_map.insert(root.clone(), spec.distribution.clone());
+                        }
+                    }
+                    // Also add cached wheels to import map (they're already extracted)
+                    for spec in &daemon_wheels {
+                        for root in &spec.import_roots {
+                            import_map.entry(root.clone())
+                                .or_insert_with(|| spec.distribution.clone());
+                        }
+                    }
+
                     let config = DaemonConfig {
                         site_packages: site_packages.clone(),
                         parallel_downloads: pd,
                         extract_threads: et,
+                        ready_dir: Some(ready_dir.clone()),
                     };
 
                     let wheels_to_cache: Vec<WheelSpec> = uncached_wheels.clone();
-                    let engine = DaemonEngine::new(uncached_wheels);
-                    engine.run(&config).await?;
+                    let engine = std::sync::Arc::new(DaemonEngine::new(uncached_wheels));
+
+                    // Wait for uv small install to finish before starting Python
+                    if let Some(handle) = uv_handle {
+                        handle.await??;
+                    }
+
+                    // Spawn daemon in background
+                    let engine_bg = engine.clone();
+                    let daemon_handle = tokio::spawn(async move {
+                        engine_bg.run(&config).await
+                    });
+
+                    eprintln!("Starting {target} (packages installing in background)...");
+
+                    // Start Python immediately with progressive loading hook
+                    let mut child = spawn_python_progressive(
+                        &python,
+                        &site_packages,
+                        &target,
+                        &target_args,
+                        &ready_dir,
+                        &import_map,
+                        &cuda_dirs,
+                    );
+
+                    // Wait for Python to finish
+                    let py_status = child.wait().unwrap_or_else(|e| {
+                        eprintln!("Failed to wait for Python: {e}");
+                        std::process::exit(1);
+                    });
+
+                    // Wait for daemon to finish
+                    if let Err(e) = daemon_handle.await? {
+                        eprintln!("Warning: daemon error: {e}");
+                    }
 
                     let (files, bytes) = engine.extract_stats();
                     if verbose {
@@ -1445,28 +1569,28 @@ async fn main() -> Result<()> {
                         );
                     }
 
-                    // Schedule shared cache population — runs in background while script executes.
-                    // Skip if ZS_NO_SHARED_CACHE=1.
-                    if std::env::var("ZS_NO_SHARED_CACHE").is_ok() {
-                        tracing::info!("Shared cache disabled via ZS_NO_SHARED_CACHE");
-                    } else {
-                        needs_cache_populate = true;
+                    // Mark complete now that everything is extracted
+                    std::fs::File::create(&complete_marker).ok();
+
+                    // Populate shared cache in background (best-effort for future cold starts)
+                    if std::env::var("ZS_NO_SHARED_CACHE").is_err() {
                         let sp_for_cache = site_packages.clone();
-                        cache_handle = Some(tokio::task::spawn_blocking(move || {
+                        tokio::task::spawn_blocking(move || {
                             if let Ok(avail) = available_disk_mb(&sp_for_cache) {
                                 if avail < 2048 {
-                                    tracing::warn!(
-                                        "Skipping shared cache — only {}MB free",
-                                        avail
-                                    );
                                     return;
                                 }
                             }
                             for spec in &wheels_to_cache {
                                 populate_shared_cache(spec, &sp_for_cache);
                             }
-                        }));
+                        });
                     }
+
+                    // Clean up ready dir
+                    let _ = std::fs::remove_dir_all(&ready_dir);
+
+                    std::process::exit(py_status.code().unwrap_or(1));
                 }
             }
 
@@ -1475,22 +1599,14 @@ async fn main() -> Result<()> {
                 handle.await??;
             }
 
-            // Mark complete — no cache population needed.
-            // Warm path uses our venv directly, doesn't need uv's cache.
+            // Mark complete
             std::fs::File::create(&complete_marker).ok();
 
             if verbose {
                 eprintln!("Environment ready — starting {target}");
             }
 
-            // If we have background cache work, spawn Python as child process
-            // so cache population can continue while the script runs.
-            // Otherwise, exec directly (more efficient, preserves signals).
-            if needs_cache_populate {
-                spawn_python_with_cache(&python, &site_packages, &target, &target_args, cache_handle, &cuda_dirs);
-            } else {
-                exec_python_with_cuda(&python, &site_packages, &target, &target_args, &cuda_dirs);
-            }
+            exec_python_with_cuda(&python, &site_packages, &target, &target_args, &cuda_dirs);
         }
 
         Command::Install {
@@ -1687,6 +1803,7 @@ async fn run_engine(
         site_packages,
         parallel_downloads,
         extract_threads,
+        ready_dir: None,
     };
 
     let engine = DaemonEngine::new(wheels);
